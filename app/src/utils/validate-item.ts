@@ -1,40 +1,66 @@
-import { FailedValidationException } from '@directus/shared/exceptions';
-import { Field, LogicalFilterAND } from '@directus/shared/types';
-import { validatePayload } from '@directus/shared/utils';
-import { flatten, isNil } from 'lodash';
+import { useRelationsStore } from '@/stores/relations';
+import { FailedValidationError, joiValidationErrorItemToErrorExtensions } from '@directus/validation';
+import { Field, LogicalFilterAND } from '@directus/types';
+import { validatePayload } from '@directus/utils';
+import { cloneDeep, flatten, isEmpty, isNil } from 'lodash';
 import { applyConditions } from './apply-conditions';
 
-export function validateItem(item: Record<string, any>, fields: Field[], isNew: boolean) {
-	const validationRules = {
-		_and: [],
-	} as LogicalFilterAND;
-
+export function validateItem(
+	item: Record<string, any>,
+	fields: Field[],
+	isNew: boolean,
+	includeCustomValidations = false,
+) {
+	const relationsStore = useRelationsStore();
+	const validationRules: LogicalFilterAND = { _and: [] };
+	const updatedItem = cloneDeep(item);
 	const fieldsWithConditions = fields.map((field) => applyConditions(item, field));
-
 	const requiredFields = fieldsWithConditions.filter((field) => field.meta?.required === true);
 
-	for (const field of requiredFields) {
+	requiredFields.forEach((field) => {
+		applyRulesForRequiredFields(field.field, field, isNew);
+
+		const relation = relationsStore.getRelationsForField(field.collection, field.field);
+		if (!relation.length) return;
+
+		const isEmptyArray = Array.isArray(updatedItem[field.field]) && isEmpty(updatedItem[field.field]);
+		if (isEmptyArray) updatedItem[field.field] = null;
+	});
+
+	if (includeCustomValidations) fields.forEach(applyValidationRules);
+
+	return flatten(
+		validatePayload(validationRules, updatedItem).map((error) =>
+			error.details.map(
+				(details) => new FailedValidationError(joiValidationErrorItemToErrorExtensions(details)).extensions,
+			),
+		),
+	).map((error) => {
+		const errorField = fields.find((field) => field.field === error.field);
+		return { ...error, hidden: errorField?.meta?.hidden, group: errorField?.meta?.group };
+	});
+
+	function applyRulesForRequiredFields(fieldKey: string, field: Field, isNew: boolean) {
 		if (isNew && isNil(field.schema?.default_value)) {
 			validationRules._and.push({
-				[field.field]: {
+				[fieldKey]: {
 					_submitted: true,
 				},
 			});
 		}
 
 		validationRules._and.push({
-			[field.field]: {
+			[fieldKey]: {
 				_nnull: true,
 			},
 		});
 	}
 
-	return flatten(
-		validatePayload(validationRules, item).map((error) =>
-			error.details.map((details) => new FailedValidationException(details).extensions)
-		)
-	).map((error) => {
-		const errorField = fields.find((field) => field.field === error.field);
-		return { ...error, hidden: errorField?.meta?.hidden, group: errorField?.meta?.group };
-	});
+	function applyValidationRules(field: Field) {
+		if (isNil(updatedItem[field.field])) return;
+
+		(field.meta?.validation as LogicalFilterAND)?._and?.forEach((validation: any) => {
+			validationRules._and.push(validation);
+		});
+	}
 }

@@ -1,6 +1,6 @@
-import { defineDisplay } from '@directus/shared/utils';
+import { defineDisplay } from '@directus/extensions';
 import DisplayCollection from './collection.vue';
-import { useCollectionsStore } from '@/stores';
+import { useCollectionsStore } from '@/stores/collections';
 
 export default defineDisplay({
 	id: 'collection',

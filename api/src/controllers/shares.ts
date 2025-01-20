@@ -1,22 +1,26 @@
+import { useEnv } from '@directus/env';
+import { ErrorCode, InvalidPayloadError, isDirectusError } from '@directus/errors';
+import type { PrimaryKey } from '@directus/types';
 import express from 'express';
-import { ForbiddenException, InvalidPayloadException } from '../exceptions';
-import { respond } from '../middleware/respond';
-import useCollection from '../middleware/use-collection';
-import { validateBatch } from '../middleware/validate-batch';
-import { SharesService } from '../services';
-import { PrimaryKey } from '../types';
-import asyncHandler from '../utils/async-handler';
-import { UUID_REGEX, COOKIE_OPTIONS } from '../constants';
 import Joi from 'joi';
-import env from '../env';
+import { REFRESH_COOKIE_OPTIONS, SESSION_COOKIE_OPTIONS, UUID_REGEX } from '../constants.js';
+import { respond } from '../middleware/respond.js';
+import useCollection from '../middleware/use-collection.js';
+import { validateBatch } from '../middleware/validate-batch.js';
+import { SharesService } from '../services/shares.js';
+import type { AuthenticationMode } from '../types/index.js';
+import asyncHandler from '../utils/async-handler.js';
+import { sanitizeQuery } from '../utils/sanitize-query.js';
 
 const router = express.Router();
+const env = useEnv();
 
 router.use(useCollection('directus_shares'));
 
 const sharedLoginSchema = Joi.object({
 	share: Joi.string().required(),
 	password: Joi.string(),
+	mode: Joi.string().valid('cookie', 'json', 'session').optional(),
 }).unknown();
 
 router.post(
@@ -30,18 +34,36 @@ router.post(
 		const { error } = sharedLoginSchema.validate(req.body);
 
 		if (error) {
-			throw new InvalidPayloadException(error.message);
+			throw new InvalidPayloadError({ reason: error.message });
 		}
 
-		const { accessToken, refreshToken, expires } = await service.login(req.body);
+		const mode: AuthenticationMode = req.body.mode ?? 'json';
 
-		res.cookie(env.REFRESH_TOKEN_COOKIE_NAME, refreshToken, COOKIE_OPTIONS);
+		const { accessToken, refreshToken, expires } = await service.login(req.body, {
+			session: mode === 'session',
+		});
 
-		res.locals.payload = { data: { access_token: accessToken, expires } };
+		const payload = { expires } as { expires: number; access_token?: string; refresh_token?: string };
+
+		if (mode === 'json') {
+			payload.refresh_token = refreshToken;
+			payload.access_token = accessToken;
+		}
+
+		if (mode === 'cookie') {
+			res.cookie(env['REFRESH_TOKEN_COOKIE_NAME'] as string, refreshToken, REFRESH_COOKIE_OPTIONS);
+			payload.access_token = accessToken;
+		}
+
+		if (mode === 'session') {
+			res.cookie(env['SESSION_COOKIE_NAME'] as string, accessToken, SESSION_COOKIE_OPTIONS);
+		}
+
+		res.locals['payload'] = { data: payload };
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 const sharedInviteSchema = Joi.object({
@@ -51,7 +73,7 @@ const sharedInviteSchema = Joi.object({
 
 router.post(
 	'/invite',
-	asyncHandler(async (req, res, next) => {
+	asyncHandler(async (req, _res, next) => {
 		const service = new SharesService({
 			schema: req.schema,
 			accountability: req.accountability,
@@ -60,14 +82,14 @@ router.post(
 		const { error } = sharedInviteSchema.validate(req.body);
 
 		if (error) {
-			throw new InvalidPayloadException(error.message);
+			throw new InvalidPayloadError({ reason: error.message });
 		}
 
 		await service.invite(req.body);
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.post(
@@ -91,13 +113,13 @@ router.post(
 		try {
 			if (Array.isArray(req.body)) {
 				const items = await service.readMany(savedKeys, req.sanitizedQuery);
-				res.locals.payload = { data: items };
+				res.locals['payload'] = { data: items };
 			} else {
-				const item = await service.readOne(savedKeys[0], req.sanitizedQuery);
-				res.locals.payload = { data: item };
+				const item = await service.readOne(savedKeys[0]!, req.sanitizedQuery);
+				res.locals['payload'] = { data: item };
 			}
-		} catch (error) {
-			if (error instanceof ForbiddenException) {
+		} catch (error: any) {
+			if (isDirectusError(error, ErrorCode.Forbidden)) {
 				return next();
 			}
 
@@ -106,7 +128,7 @@ router.post(
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 const readHandler = asyncHandler(async (req, res, next) => {
@@ -117,7 +139,7 @@ const readHandler = asyncHandler(async (req, res, next) => {
 
 	const records = await service.readByQuery(req.sanitizedQuery);
 
-	res.locals.payload = { data: records || null };
+	res.locals['payload'] = { data: records || null };
 	return next();
 });
 
@@ -131,7 +153,7 @@ router.get(
 			schema: req.schema,
 		});
 
-		const record = await service.readOne(req.params.pk, {
+		const record = await service.readOne(req.params['pk']!, {
 			fields: ['id', 'collection', 'item', 'password', 'max_uses', 'times_used', 'date_start', 'date_end'],
 			filter: {
 				_and: [
@@ -167,10 +189,10 @@ router.get(
 			},
 		});
 
-		res.locals.payload = { data: record || null };
+		res.locals['payload'] = { data: record || null };
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.get(
@@ -181,12 +203,12 @@ router.get(
 			schema: req.schema,
 		});
 
-		const record = await service.readOne(req.params.pk, req.sanitizedQuery);
+		const record = await service.readOne(req.params['pk']!, req.sanitizedQuery);
 
-		res.locals.payload = { data: record || null };
+		res.locals['payload'] = { data: record || null };
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.patch(
@@ -205,14 +227,15 @@ router.patch(
 		} else if (req.body.keys) {
 			keys = await service.updateMany(req.body.keys, req.body.data);
 		} else {
-			keys = await service.updateByQuery(req.body.query, req.body.data);
+			const sanitizedQuery = sanitizeQuery(req.body.query, req.accountability);
+			keys = await service.updateByQuery(sanitizedQuery, req.body.data);
 		}
 
 		try {
 			const result = await service.readMany(keys, req.sanitizedQuery);
-			res.locals.payload = { data: result };
-		} catch (error) {
-			if (error instanceof ForbiddenException) {
+			res.locals['payload'] = { data: result };
+		} catch (error: any) {
+			if (isDirectusError(error, ErrorCode.Forbidden)) {
 				return next();
 			}
 
@@ -221,7 +244,7 @@ router.patch(
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.patch(
@@ -232,13 +255,13 @@ router.patch(
 			schema: req.schema,
 		});
 
-		const primaryKey = await service.updateOne(req.params.pk, req.body);
+		const primaryKey = await service.updateOne(req.params['pk']!, req.body);
 
 		try {
 			const item = await service.readOne(primaryKey, req.sanitizedQuery);
-			res.locals.payload = { data: item || null };
-		} catch (error) {
-			if (error instanceof ForbiddenException) {
+			res.locals['payload'] = { data: item || null };
+		} catch (error: any) {
+			if (isDirectusError(error, ErrorCode.Forbidden)) {
 				return next();
 			}
 
@@ -247,7 +270,7 @@ router.patch(
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.delete(
@@ -263,12 +286,13 @@ router.delete(
 		} else if (req.body.keys) {
 			await service.deleteMany(req.body.keys);
 		} else {
-			await service.deleteByQuery(req.body.query);
+			const sanitizedQuery = sanitizeQuery(req.body.query, req.accountability);
+			await service.deleteByQuery(sanitizedQuery);
 		}
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 router.delete(
@@ -279,11 +303,11 @@ router.delete(
 			schema: req.schema,
 		});
 
-		await service.deleteOne(req.params.pk);
+		await service.deleteOne(req.params['pk']!);
 
 		return next();
 	}),
-	respond
+	respond,
 );
 
 export default router;

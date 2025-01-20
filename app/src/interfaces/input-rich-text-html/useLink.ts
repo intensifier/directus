@@ -18,6 +18,7 @@ type LinkButton = {
 type UsableLink = {
 	linkDrawerOpen: Ref<boolean>;
 	linkSelection: Ref<LinkSelection>;
+	linkNode: Ref<HTMLLinkElement | null>;
 	closeLinkDrawer: () => void;
 	saveLink: () => void;
 	linkButton: LinkButton;
@@ -25,14 +26,16 @@ type UsableLink = {
 
 export default function useLink(editor: Ref<any>): UsableLink {
 	const linkDrawerOpen = ref(false);
+
 	const defaultLinkSelection = {
 		url: null,
 		displayText: null,
 		title: null,
 		newTab: true,
 	};
+
 	const linkSelection = ref<LinkSelection>(defaultLinkSelection);
-	const linkNode = ref<HTMLLinkElement | null>(null);
+	const linkNode: Ref<HTMLLinkElement | null> = ref(null);
 	const currentSelectionNode = ref<HTMLElement | null>(null);
 
 	const linkButton = {
@@ -64,8 +67,14 @@ export default function useLink(editor: Ref<any>): UsableLink {
 					newTab: target === '_blank',
 				};
 			} else {
-				const overrideLinkSelection = { displayText: editor.value.selection.getContent() || null };
-				setLinkSelection(overrideLinkSelection);
+				const selectedContent = editor.value.selection.getContent();
+
+				try {
+					const url = new URL(selectedContent).toString();
+					setLinkSelection({ url });
+				} catch {
+					setLinkSelection({ displayText: selectedContent || null });
+				}
 			}
 		},
 		onSetup: (buttonApi: any) => {
@@ -94,7 +103,7 @@ export default function useLink(editor: Ref<any>): UsableLink {
 		},
 	};
 
-	return { linkDrawerOpen, linkSelection, closeLinkDrawer, saveLink, linkButton };
+	return { linkDrawerOpen, linkSelection, linkNode, closeLinkDrawer, saveLink, linkButton };
 
 	function setLinkSelection(overrideLinkSelection: Partial<LinkSelection> = {}) {
 		linkSelection.value = Object.assign({}, defaultLinkSelection, overrideLinkSelection);
@@ -109,10 +118,19 @@ export default function useLink(editor: Ref<any>): UsableLink {
 		editor.value.fire('focus');
 
 		const link = linkSelection.value;
-		if (link.url === null) return;
-		const linkHtml = `<a href="${link.url}" ${link.title ? `title="${link.title}"` : ''} target="${
-			link.newTab ? '_blank' : '_self'
-		}" >${link.displayText || link.url}</a>`;
+
+		if (link.url === null) {
+			if (linkNode.value) {
+				editor.value.selection.setContent(linkNode.value.innerText);
+				closeLinkDrawer();
+			}
+
+			return;
+		}
+
+		const linkHtml = `<a href="${link.url}" ${link.title ? `title="${link.title}"` : ''} ${
+			link.newTab ? 'target="_blank"' : ''
+		} >${link.displayText || link.url}</a>`;
 
 		// New anchor tag or current selection node is an anchor tag
 		if (!linkNode.value || currentSelectionNode.value === linkNode.value) {

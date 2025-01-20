@@ -1,42 +1,30 @@
-import * as sharedExceptions from '@directus/shared/exceptions';
-import {
-	Accountability,
-	Action,
-	ActionHandler,
-	FilterHandler,
-	Flow,
-	Operation,
-	OperationHandler,
-	SchemaOverview,
-} from '@directus/shared/types';
-import { applyOptionsData } from '@directus/shared/utils';
-import fastRedact from 'fast-redact';
-import { Knex } from 'knex';
-import { omit } from 'lodash';
+import { Action } from '@directus/constants';
+import { useEnv } from '@directus/env';
+import { ForbiddenError } from '@directus/errors';
+import type { OperationHandler } from '@directus/extensions';
+import { isSystemCollection } from '@directus/system-data';
+import type { Accountability, ActionHandler, FilterHandler, Flow, Operation, SchemaOverview } from '@directus/types';
+import { applyOptionsData, getRedactedString, isValidJSON, parseJSON, toArray } from '@directus/utils';
+import type { Knex } from 'knex';
+import { pick } from 'lodash-es';
 import { get } from 'micromustache';
-import { schedule, validate } from 'node-cron';
-import getDatabase from './database';
-import emitter from './emitter';
-import env from './env';
-import * as exceptions from './exceptions';
-import logger from './logger';
-import { getMessenger } from './messenger';
-import * as services from './services';
-import { FlowsService } from './services';
-import { ActivityService } from './services/activity';
-import { RevisionsService } from './services/revisions';
-import { EventHandler } from './types';
-import { constructFlowTree } from './utils/construct-flow-tree';
-import { getSchema } from './utils/get-schema';
-import { JobQueue } from './utils/job-queue';
+import { useBus } from './bus/index.js';
+import getDatabase from './database/index.js';
+import emitter from './emitter.js';
+import { useLogger } from './logger/index.js';
+import { ActivityService } from './services/activity.js';
+import { FlowsService } from './services/flows.js';
+import * as services from './services/index.js';
+import { RevisionsService } from './services/revisions.js';
+import type { EventHandler } from './types/index.js';
+import { constructFlowTree } from './utils/construct-flow-tree.js';
+import { getSchema } from './utils/get-schema.js';
+import { JobQueue } from './utils/job-queue.js';
+import { mapValuesDeep } from './utils/map-values-deep.js';
+import { redactObject } from './utils/redact-object.js';
+import { scheduleSynchronizedJob, validateCron } from './utils/schedule.js';
 
 let flowManager: FlowManager | undefined;
-
-const redactLogs = fastRedact({
-	censor: '--redacted--',
-	paths: ['*.headers.authorization', '*.access_token', '*.headers.cookie'],
-	serialize: false,
-});
 
 export function getFlowManager(): FlowManager {
 	if (flowManager) {
@@ -56,25 +44,35 @@ type TriggerHandler = {
 const TRIGGER_KEY = '$trigger';
 const ACCOUNTABILITY_KEY = '$accountability';
 const LAST_KEY = '$last';
+const ENV_KEY = '$env';
+
+interface FlowMessage {
+	type: 'reload';
+}
 
 class FlowManager {
 	private isLoaded = false;
 
-	private operations: Record<string, OperationHandler> = {};
+	private operations: Map<string, OperationHandler> = new Map();
 
 	private triggerHandlers: TriggerHandler[] = [];
 	private operationFlowHandlers: Record<string, any> = {};
 	private webhookFlowHandlers: Record<string, any> = {};
 
 	private reloadQueue: JobQueue;
+	private envs: Record<string, any>;
 
 	constructor() {
+		const env = useEnv();
+		const logger = useLogger();
+
 		this.reloadQueue = new JobQueue();
+		this.envs = env['FLOWS_ENV_ALLOW_LIST'] ? pick(env, toArray(env['FLOWS_ENV_ALLOW_LIST'] as string)) : {};
 
-		const messenger = getMessenger();
+		const messenger = useBus();
 
-		messenger.subscribe('flows', (event) => {
-			if (event.type === 'reload') {
+		messenger.subscribe<FlowMessage>('flows', (event) => {
+			if (event['type'] === 'reload') {
 				this.reloadQueue.enqueue(async () => {
 					if (this.isLoaded) {
 						await this.unload();
@@ -94,20 +92,22 @@ class FlowManager {
 	}
 
 	public async reload(): Promise<void> {
-		const messenger = getMessenger();
+		const messenger = useBus();
 
-		messenger.publish('flows', { type: 'reload' });
+		messenger.publish<FlowMessage>('flows', { type: 'reload' });
 	}
 
 	public addOperation(id: string, operation: OperationHandler): void {
-		this.operations[id] = operation;
+		this.operations.set(id, operation);
 	}
 
-	public clearOperations(): void {
-		this.operations = {};
+	public removeOperation(id: string): void {
+		this.operations.delete(id);
 	}
 
 	public async runOperationFlow(id: string, data: unknown, context: Record<string, unknown>): Promise<unknown> {
+		const logger = useLogger();
+
 		if (!(id in this.operationFlowHandlers)) {
 			logger.warn(`Couldn't find operation triggered flow with id "${id}"`);
 			return null;
@@ -118,10 +118,16 @@ class FlowManager {
 		return handler(data, context);
 	}
 
-	public async runWebhookFlow(id: string, data: unknown, context: Record<string, unknown>): Promise<unknown> {
+	public async runWebhookFlow(
+		id: string,
+		data: unknown,
+		context: Record<string, unknown>,
+	): Promise<{ result: unknown; cacheEnabled?: boolean }> {
+		const logger = useLogger();
+
 		if (!(id in this.webhookFlowHandlers)) {
 			logger.warn(`Couldn't find webhook or manual triggered flow with id "${id}"`);
-			throw new exceptions.ForbiddenException();
+			throw new ForbiddenError();
 		}
 
 		const handler = this.webhookFlowHandlers[id];
@@ -130,71 +136,79 @@ class FlowManager {
 	}
 
 	private async load(): Promise<void> {
+		const logger = useLogger();
+
 		const flowsService = new FlowsService({ knex: getDatabase(), schema: await getSchema() });
 
 		const flows = await flowsService.readByQuery({
 			filter: { status: { _eq: 'active' } },
 			fields: ['*', 'operations.*'],
+			limit: -1,
 		});
 
 		const flowTrees = flows.map((flow) => constructFlowTree(flow));
 
 		for (const flow of flowTrees) {
 			if (flow.trigger === 'event') {
-				const events: string[] =
-					flow.options?.scope
-						?.map((scope: string) => {
-							if (['items.create', 'items.update', 'items.delete'].includes(scope)) {
-								return (
-									flow.options?.collections?.map((collection: string) => {
-										if (collection.startsWith('directus_')) {
-											const action = scope.split('.')[1];
-											return collection.substring(9) + '.' + action;
-										}
+				let events: string[] = [];
 
-										return `${collection}.${scope}`;
-									}) ?? []
-								);
+				if (flow.options?.['scope']) {
+					events = toArray(flow.options['scope'])
+						.map((scope: string) => {
+							if (['items.create', 'items.update', 'items.delete'].includes(scope)) {
+								if (!flow.options?.['collections']) return [];
+
+								return toArray(flow.options['collections']).map((collection: string) => {
+									if (isSystemCollection(collection)) {
+										const action = scope.split('.')[1];
+										return collection.substring(9) + '.' + action;
+									}
+
+									return `${collection}.${scope}`;
+								});
 							}
 
 							return scope;
 						})
-						?.flat() ?? [];
+						.flat();
+				}
 
-				if (flow.options.type === 'filter') {
+				if (flow.options['type'] === 'filter') {
 					const handler: FilterHandler = (payload, meta, context) =>
 						this.executeFlow(
 							flow,
 							{ payload, ...meta },
 							{
-								accountability: context.accountability,
-								database: context.database,
-								getSchema: context.schema ? () => context.schema : getSchema,
-							}
+								accountability: context['accountability'],
+								database: context['database'],
+								getSchema: context['schema'] ? () => context['schema'] : getSchema,
+							},
 						);
 
 					events.forEach((event) => emitter.onFilter(event, handler));
+
 					this.triggerHandlers.push({
 						id: flow.id,
 						events: events.map((event) => ({ type: 'filter', name: event, handler })),
 					});
-				} else if (flow.options.type === 'action') {
+				} else if (flow.options['type'] === 'action') {
 					const handler: ActionHandler = (meta, context) =>
 						this.executeFlow(flow, meta, {
-							accountability: context.accountability,
+							accountability: context['accountability'],
 							database: getDatabase(),
-							getSchema: context.schema ? () => context.schema : getSchema,
+							getSchema: context['schema'] ? () => context['schema'] : getSchema,
 						});
 
 					events.forEach((event) => emitter.onAction(event, handler));
+
 					this.triggerHandlers.push({
 						id: flow.id,
 						events: events.map((event) => ({ type: 'action', name: event, handler })),
 					});
 				}
 			} else if (flow.trigger === 'schedule') {
-				if (validate(flow.options.cron)) {
-					const task = schedule(flow.options.cron, async () => {
+				if (validateCron(flow.options['cron'])) {
+					const job = scheduleSynchronizedJob(flow.id, flow.options['cron'], async () => {
 						try {
 							await this.executeFlow(flow);
 						} catch (error: any) {
@@ -202,58 +216,66 @@ class FlowManager {
 						}
 					});
 
-					this.triggerHandlers.push({ id: flow.id, events: [{ type: flow.trigger, task }] });
+					this.triggerHandlers.push({ id: flow.id, events: [{ type: flow.trigger, job }] });
 				} else {
-					logger.warn(`Couldn't register cron trigger. Provided cron is invalid: ${flow.options.cron}`);
+					logger.warn(`Couldn't register cron trigger. Provided cron is invalid: ${flow.options['cron']}`);
 				}
 			} else if (flow.trigger === 'operation') {
 				const handler = (data: unknown, context: Record<string, unknown>) => this.executeFlow(flow, data, context);
 
 				this.operationFlowHandlers[flow.id] = handler;
 			} else if (flow.trigger === 'webhook') {
-				const handler = (data: unknown, context: Record<string, unknown>) => {
-					if (flow.options.async) {
+				const method = flow.options?.['method'] ?? 'GET';
+
+				const handler = async (data: unknown, context: Record<string, unknown>) => {
+					let cacheEnabled = true;
+
+					if (method === 'GET') {
+						cacheEnabled = flow.options['cacheEnabled'] !== false;
+					}
+
+					if (flow.options['async']) {
 						this.executeFlow(flow, data, context);
+						return { result: undefined, cacheEnabled };
 					} else {
-						return this.executeFlow(flow, data, context);
+						return { result: await this.executeFlow(flow, data, context), cacheEnabled };
 					}
 				};
 
-				const method = flow.options?.method ?? 'GET';
-
 				// Default return to $last for webhooks
-				flow.options.return = flow.options.return ?? '$last';
+				flow.options['return'] = flow.options['return'] ?? '$last';
 
 				this.webhookFlowHandlers[`${method}-${flow.id}`] = handler;
 			} else if (flow.trigger === 'manual') {
-				const handler = (data: unknown, context: Record<string, unknown>) => {
-					const enabledCollections = flow.options?.collections ?? [];
-					const targetCollection = (data as Record<string, any>)?.body.collection;
+				const handler = async (data: unknown, context: Record<string, unknown>) => {
+					const enabledCollections = flow.options?.['collections'] ?? [];
+					const targetCollection = (data as Record<string, any>)?.['body'].collection;
 
 					if (!targetCollection) {
 						logger.warn(`Manual trigger requires "collection" to be specified in the payload`);
-						throw new exceptions.ForbiddenException();
+						throw new ForbiddenError();
 					}
 
 					if (enabledCollections.length === 0) {
 						logger.warn(`There is no collections configured for this manual trigger`);
-						throw new exceptions.ForbiddenException();
+						throw new ForbiddenError();
 					}
 
 					if (!enabledCollections.includes(targetCollection)) {
 						logger.warn(`Specified collection must be one of: ${enabledCollections.join(', ')}.`);
-						throw new exceptions.ForbiddenException();
+						throw new ForbiddenError();
 					}
 
-					if (flow.options.async) {
+					if (flow.options['async']) {
 						this.executeFlow(flow, data, context);
+						return { result: undefined };
 					} else {
-						return this.executeFlow(flow, data, context);
+						return { result: await this.executeFlow(flow, data, context) };
 					}
 				};
 
 				// Default return to $last for manual
-				flow.options.return = '$last';
+				flow.options['return'] = '$last';
 
 				this.webhookFlowHandlers[`POST-${flow.id}`] = handler;
 			}
@@ -264,7 +286,7 @@ class FlowManager {
 
 	private async unload(): Promise<void> {
 		for (const trigger of this.triggerHandlers) {
-			trigger.events.forEach((event) => {
+			for (const event of trigger.events) {
 				switch (event.type) {
 					case 'filter':
 						emitter.offFilter(event.name, event.handler);
@@ -273,10 +295,10 @@ class FlowManager {
 						emitter.offAction(event.name, event.handler);
 						break;
 					case 'schedule':
-						event.task.stop();
+						await event.job.stop();
 						break;
 				}
-			});
+			}
 		}
 
 		this.triggerHandlers = [];
@@ -287,16 +309,18 @@ class FlowManager {
 	}
 
 	private async executeFlow(flow: Flow, data: unknown = null, context: Record<string, unknown> = {}): Promise<unknown> {
-		const database = (context.database as Knex) ?? getDatabase();
-		const schema = (context.schema as SchemaOverview) ?? (await getSchema({ database }));
+		const database = (context['database'] as Knex) ?? getDatabase();
+		const schema = (context['schema'] as SchemaOverview) ?? (await getSchema({ database }));
 
 		const keyedData: Record<string, unknown> = {
 			[TRIGGER_KEY]: data,
 			[LAST_KEY]: data,
-			[ACCOUNTABILITY_KEY]: context?.accountability ?? null,
+			[ACCOUNTABILITY_KEY]: context?.['accountability'] ?? null,
+			[ENV_KEY]: this.envs,
 		};
 
 		let nextOperation = flow.operation;
+		let lastOperationStatus: 'resolve' | 'reject' | 'unknown' = 'unknown';
 
 		const steps: {
 			operation: string;
@@ -310,6 +334,7 @@ class FlowManager {
 
 			keyedData[nextOperation.key] = data;
 			keyedData[LAST_KEY] = data;
+			lastOperationStatus = status;
 			steps.push({ operation: nextOperation!.id, key: nextOperation.key, status, options });
 
 			nextOperation = successor;
@@ -321,7 +346,7 @@ class FlowManager {
 				schema: schema,
 			});
 
-			const accountability = context?.accountability as Accountability | undefined;
+			const accountability = context?.['accountability'] as Accountability | undefined;
 
 			const activity = await activityService.createOne({
 				action: Action.RUN,
@@ -329,6 +354,7 @@ class FlowManager {
 				collection: 'directus_flows',
 				ip: accountability?.ip ?? null,
 				user_agent: accountability?.userAgent ?? null,
+				origin: accountability?.origin ?? null,
 				item: flow.id,
 			});
 
@@ -343,17 +369,33 @@ class FlowManager {
 					collection: 'directus_flows',
 					item: flow.id,
 					data: {
-						steps: steps,
-						data: redactLogs(omit(keyedData, '$accountability.permissions')), // Permissions is a ton of data, and is just a copy of what's in the directus_permissions table
+						steps: steps.map((step) => redactObject(step, { values: this.envs }, getRedactedString)),
+						data: redactObject(
+							keyedData,
+							{
+								keys: [
+									['**', 'headers', 'authorization'],
+									['**', 'headers', 'cookie'],
+									['**', 'query', 'access_token'],
+									['**', 'payload', 'password'],
+								],
+								values: this.envs,
+							},
+							getRedactedString,
+						),
 					},
 				});
 			}
 		}
 
-		if (flow.options.return === '$all') {
+		if (flow.trigger === 'event' && flow.options['type'] === 'filter' && lastOperationStatus === 'reject') {
+			throw keyedData[LAST_KEY];
+		}
+
+		if (flow.options['return'] === '$all') {
 			return keyedData;
-		} else if (flow.options.return) {
-			return get(keyedData, flow.options.return);
+		} else if (flow.options['return']) {
+			return get(keyedData, flow.options['return']);
 		}
 
 		return undefined;
@@ -362,27 +404,29 @@ class FlowManager {
 	private async executeOperation(
 		operation: Operation,
 		keyedData: Record<string, unknown>,
-		context: Record<string, unknown> = {}
+		context: Record<string, unknown> = {},
 	): Promise<{
 		successor: Operation | null;
 		status: 'resolve' | 'reject' | 'unknown';
 		data: unknown;
 		options: Record<string, any> | null;
 	}> {
-		if (!(operation.type in this.operations)) {
+		const logger = useLogger();
+
+		if (!this.operations.has(operation.type)) {
 			logger.warn(`Couldn't find operation ${operation.type}`);
+
 			return { successor: null, status: 'unknown', data: null, options: null };
 		}
 
-		const handler = this.operations[operation.type];
+		const handler = this.operations.get(operation.type)!;
 
 		const options = applyOptionsData(operation.options, keyedData);
 
 		try {
-			const result = await handler(options, {
+			let result = await handler(options, {
 				services,
-				exceptions: { ...exceptions, ...sharedExceptions },
-				env,
+				env: useEnv(),
 				database: getDatabase(),
 				logger,
 				getSchema,
@@ -391,9 +435,37 @@ class FlowManager {
 				...context,
 			});
 
+			// Validate that the operations result is serializable and thus catching the error inside the flow execution
+			JSON.stringify(result ?? null);
+
+			// JSON structures don't allow for undefined values, so we need to replace them with null
+			// Otherwise the applyOptionsData function will not work correctly on the next operation
+			if (typeof result === 'object' && result !== null) {
+				result = mapValuesDeep(result, (_, value) => (value === undefined ? null : value));
+			}
+
 			return { successor: operation.resolve, status: 'resolve', data: result ?? null, options };
-		} catch (error: unknown) {
-			return { successor: operation.reject, status: 'reject', data: error ?? null, options };
+		} catch (error) {
+			let data;
+
+			if (error instanceof Error) {
+				// Don't expose the stack trace to the next operation
+				delete error.stack;
+				data = error;
+			} else if (typeof error === 'string') {
+				// If the error is a JSON string, parse it and use that as the error data
+				data = isValidJSON(error) ? parseJSON(error) : error;
+			} else {
+				// If error is plain object, use this as the error data and otherwise fallback to null
+				data = error ?? null;
+			}
+
+			return {
+				successor: operation.reject,
+				status: 'reject',
+				data,
+				options,
+			};
 		}
 	}
 }

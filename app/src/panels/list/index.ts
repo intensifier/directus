@@ -1,16 +1,26 @@
-import { useFieldsStore } from '@/stores';
-import adjustFieldsForDisplays from '@/utils/adjust-fields-for-displays';
-import { definePanel, getFieldsFromTemplate } from '@directus/shared/utils';
+import { useCollectionsStore } from '@/stores/collections';
+import { useFieldsStore } from '@/stores/fields';
+import { adjustFieldsForDisplays } from '@/utils/adjust-fields-for-displays';
+import { definePanel } from '@directus/extensions';
+import { getFieldsFromTemplate } from '@directus/utils';
 import PanelList from './panel-list.vue';
+import PreviewSVG from './preview.svg?raw';
 
 export default definePanel({
 	id: 'list',
 	name: '$t:panels.list.name',
 	description: '$t:panels.list.description',
 	icon: 'list',
+	preview: PreviewSVG,
 	component: PanelList,
 	query(options) {
 		if (!options?.collection) return;
+
+		const collectionsStore = useCollectionsStore();
+		const collectionInfo = collectionsStore.getCollection(options.collection);
+
+		if (!collectionInfo) return;
+		if (collectionInfo?.meta?.singleton) return;
 
 		const fieldsStore = useFieldsStore();
 		const primaryKeyField = fieldsStore.getPrimaryKeyFieldForCollection(options.collection);
@@ -20,7 +30,7 @@ export default definePanel({
 
 		if (options.displayTemplate) {
 			displayFields.push(
-				...adjustFieldsForDisplays(getFieldsFromTemplate(options.displayTemplate), options.collection)
+				...adjustFieldsForDisplays(getFieldsFromTemplate(options.displayTemplate), options.collection),
 			);
 		}
 
@@ -43,6 +53,7 @@ export default definePanel({
 				interface: 'system-collection',
 				options: {
 					includeSystem: true,
+					includeSingleton: false,
 				},
 				width: 'half',
 			},
@@ -103,11 +114,24 @@ export default definePanel({
 			type: 'string',
 			meta: {
 				interface: 'system-display-template',
-				width: 'full',
+				width: 'half',
 				options: {
 					collectionField: 'collection',
 					placeholder: '{{ field }}',
 				},
+			},
+		},
+		{
+			field: 'linkToItem',
+			name: '$t:list_panel_allow_edit',
+			type: 'boolean',
+			meta: {
+				width: 'half',
+				interface: 'toggle',
+				required: true,
+			},
+			schema: {
+				default_value: false,
 			},
 		},
 		{
@@ -118,6 +142,7 @@ export default definePanel({
 				interface: 'system-filter',
 				options: {
 					collectionField: 'collection',
+					relationalFieldSelectable: false,
 				},
 			},
 		},

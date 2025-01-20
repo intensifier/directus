@@ -1,9 +1,9 @@
-import { Accountability, PrimaryKey } from '@directus/shared/types';
-import { defineOperationApi, optionToObject, toArray } from '@directus/shared/utils';
-import { ItemsService } from '../../services';
-import { Item } from '../../types';
-import { getAccountabilityForRole } from '../../utils/get-accountability-for-role';
-import { sanitizeQuery } from '../../utils/sanitize-query';
+import { defineOperationApi } from '@directus/extensions';
+import type { Accountability, Item, PrimaryKey } from '@directus/types';
+import { optionToObject, toArray } from '@directus/utils';
+import { ItemsService } from '../../services/items.js';
+import { getAccountabilityForRole } from '../../utils/get-accountability-for-role.js';
+import { sanitizeQuery } from '../../utils/sanitize-query.js';
 
 type Options = {
 	collection: string;
@@ -19,16 +19,15 @@ export default defineOperationApi<Options>({
 
 	handler: async (
 		{ collection, key, payload, query, emitEvents, permissions },
-		{ accountability, database, getSchema }
+		{ accountability, database, getSchema },
 	) => {
 		const schema = await getSchema({ database });
-
 		let customAccountability: Accountability | null;
 
 		if (!permissions || permissions === '$trigger') {
 			customAccountability = accountability;
 		} else if (permissions === '$full') {
-			customAccountability = null;
+			customAccountability = await getAccountabilityForRole('system', { database, schema, accountability });
 		} else if (permissions === '$public') {
 			customAccountability = await getAccountabilityForRole(null, { database, schema, accountability });
 		} else {
@@ -52,15 +51,17 @@ export default defineOperationApi<Options>({
 
 		let result: PrimaryKey | PrimaryKey[] | null;
 
-		if (!key || (Array.isArray(key) && key.length === 0)) {
-			result = await itemsService.updateByQuery(sanitizedQueryObject, payloadObject, { emitEvents });
+		if (Array.isArray(payloadObject)) {
+			result = await itemsService.updateBatch(payloadObject, { emitEvents: !!emitEvents });
+		} else if (!key || (Array.isArray(key) && key.length === 0)) {
+			result = await itemsService.updateByQuery(sanitizedQueryObject, payloadObject, { emitEvents: !!emitEvents });
 		} else {
 			const keys = toArray(key);
 
 			if (keys.length === 1) {
-				result = await itemsService.updateOne(keys[0], payloadObject, { emitEvents });
+				result = await itemsService.updateOne(keys[0]!, payloadObject, { emitEvents: !!emitEvents });
 			} else {
-				result = await itemsService.updateMany(keys, payloadObject, { emitEvents });
+				result = await itemsService.updateMany(keys, payloadObject, { emitEvents: !!emitEvents });
 			}
 		}
 

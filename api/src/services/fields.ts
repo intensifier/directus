@@ -1,27 +1,42 @@
-import SchemaInspector from '@directus/schema';
-import { REGEX_BETWEEN_PARENS } from '@directus/shared/constants';
-import { Accountability, Field, FieldMeta, RawField, SchemaOverview, Type } from '@directus/shared/types';
-import { addFieldFlag, toArray } from '@directus/shared/utils';
-import Keyv from 'keyv';
-import { Knex } from 'knex';
-import { Column } from 'knex-schema-inspector/dist/types/column';
-import { isEqual, isNil } from 'lodash';
-import { clearSystemCache, getCache } from '../cache';
-import { ALIAS_TYPES } from '../constants';
-import getDatabase, { getSchemaInspector } from '../database';
-import { getHelpers, Helpers } from '../database/helpers';
-import { systemFieldRows } from '../database/system-data/fields/';
-import emitter from '../emitter';
-import env from '../env';
-import { ForbiddenException, InvalidPayloadException } from '../exceptions';
-import { translateDatabaseError } from '../exceptions/database/translate';
-import { ItemsService } from '../services/items';
-import { PayloadService } from '../services/payload';
-import { AbstractServiceOptions } from '../types';
-import getDefaultValue from '../utils/get-default-value';
-import getLocalType from '../utils/get-local-type';
-import { RelationsService } from './relations';
-import { KNEX_TYPES } from '@directus/shared/constants';
+import {
+	DEFAULT_NUMERIC_PRECISION,
+	DEFAULT_NUMERIC_SCALE,
+	KNEX_TYPES,
+	REGEX_BETWEEN_PARENS,
+} from '@directus/constants';
+import { useEnv } from '@directus/env';
+import { ForbiddenError, InvalidPayloadError } from '@directus/errors';
+import type { Column, SchemaInspector } from '@directus/schema';
+import { createInspector } from '@directus/schema';
+import type { Accountability, Field, FieldMeta, RawField, SchemaOverview, Type } from '@directus/types';
+import { addFieldFlag, toArray } from '@directus/utils';
+import type Keyv from 'keyv';
+import type { Knex } from 'knex';
+import { isEqual, isNil, merge } from 'lodash-es';
+import { clearSystemCache, getCache, getCacheValue, setCacheValue } from '../cache.js';
+import { ALIAS_TYPES, ALLOWED_DB_DEFAULT_FUNCTIONS } from '../constants.js';
+import { translateDatabaseError } from '../database/errors/translate.js';
+import type { Helpers } from '../database/helpers/index.js';
+import { getHelpers } from '../database/helpers/index.js';
+import getDatabase, { getSchemaInspector } from '../database/index.js';
+import emitter from '../emitter.js';
+import { fetchPermissions } from '../permissions/lib/fetch-permissions.js';
+import { fetchPolicies } from '../permissions/lib/fetch-policies.js';
+import { validateAccess } from '../permissions/modules/validate-access/validate-access.js';
+import type { AbstractServiceOptions, ActionEventParams, MutationOptions } from '../types/index.js';
+import getDefaultValue from '../utils/get-default-value.js';
+import { getSystemFieldRowsWithAuthProviders } from '../utils/get-field-system-rows.js';
+import getLocalType from '../utils/get-local-type.js';
+import { getSchema } from '../utils/get-schema.js';
+import { sanitizeColumn } from '../utils/sanitize-schema.js';
+import { shouldClearCache } from '../utils/should-clear-cache.js';
+import { transaction } from '../utils/transaction.js';
+import { ItemsService } from './items.js';
+import { PayloadService } from './payload.js';
+import { RelationsService } from './relations.js';
+
+const systemFieldRows = getSystemFieldRowsWithAuthProviders();
+const env = useEnv();
 
 export class FieldsService {
 	knex: Knex;
@@ -29,37 +44,73 @@ export class FieldsService {
 	accountability: Accountability | null;
 	itemsService: ItemsService;
 	payloadService: PayloadService;
-	schemaInspector: ReturnType<typeof SchemaInspector>;
+	schemaInspector: SchemaInspector;
 	schema: SchemaOverview;
 	cache: Keyv<any> | null;
 	systemCache: Keyv<any>;
+	schemaCache: Keyv<any>;
 
 	constructor(options: AbstractServiceOptions) {
 		this.knex = options.knex || getDatabase();
 		this.helpers = getHelpers(this.knex);
-		this.schemaInspector = options.knex ? SchemaInspector(options.knex) : getSchemaInspector();
+		this.schemaInspector = options.knex ? createInspector(options.knex) : getSchemaInspector();
 		this.accountability = options.accountability || null;
 		this.itemsService = new ItemsService('directus_fields', options);
 		this.payloadService = new PayloadService('directus_fields', options);
 		this.schema = options.schema;
 
-		const { cache, systemCache } = getCache();
+		const { cache, systemCache, localSchemaCache } = getCache();
 
 		this.cache = cache;
 		this.systemCache = systemCache;
+		this.schemaCache = localSchemaCache;
 	}
 
-	private get hasReadAccess() {
-		return !!this.accountability?.permissions?.find((permission) => {
-			return permission.collection === 'directus_fields' && permission.action === 'read';
-		});
+	async columnInfo(collection?: string): Promise<Column[]>;
+	async columnInfo(collection: string, field: string): Promise<Column>;
+	async columnInfo(collection?: string, field?: string): Promise<Column | Column[]> {
+		const schemaCacheIsEnabled = Boolean(env['CACHE_SCHEMA']);
+
+		let columnInfo: Column[] | null = null;
+
+		if (schemaCacheIsEnabled) {
+			columnInfo = await getCacheValue(this.schemaCache, 'columnInfo');
+		}
+
+		if (!columnInfo) {
+			columnInfo = await this.schemaInspector.columnInfo();
+
+			if (schemaCacheIsEnabled) {
+				setCacheValue(this.schemaCache, 'columnInfo', columnInfo);
+			}
+		}
+
+		if (collection) {
+			columnInfo = columnInfo.filter((column) => column.table === collection);
+		}
+
+		if (field) {
+			return columnInfo.find((column) => column.name === field) as Column;
+		}
+
+		return columnInfo;
 	}
 
 	async readAll(collection?: string): Promise<Field[]> {
 		let fields: FieldMeta[];
 
-		if (this.accountability && this.accountability.admin !== true && this.hasReadAccess === false) {
-			throw new ForbiddenException();
+		if (this.accountability) {
+			await validateAccess(
+				{
+					accountability: this.accountability,
+					action: 'read',
+					collection: 'directus_fields',
+				},
+				{
+					schema: this.schema,
+					knex: this.knex,
+				},
+			);
 		}
 
 		const nonAuthorizedItemsService = new ItemsService('directus_fields', {
@@ -79,9 +130,12 @@ export class FieldsService {
 			fields.push(...systemFieldRows);
 		}
 
-		const columns = (await this.schemaInspector.columnInfo(collection)).map((column) => ({
+		const columns = (await this.columnInfo(collection)).map((column) => ({
 			...column,
-			default_value: getDefaultValue(column),
+			default_value: getDefaultValue(
+				column,
+				fields.find((field) => field.collection === column.table && field.field === column.name),
+			),
 		}));
 
 		const columnsWithSystem = columns.map((column) => {
@@ -143,30 +197,50 @@ export class FieldsService {
 		const knownCollections = Object.keys(this.schema.collections);
 
 		const result = [...columnsWithSystem, ...aliasFieldsAsField].filter((field) =>
-			knownCollections.includes(field.collection)
+			knownCollections.includes(field.collection),
 		);
 
 		// Filter the result so we only return the fields you have read access to
 		if (this.accountability && this.accountability.admin !== true) {
-			const permissions = this.accountability.permissions!.filter((permission) => {
-				return permission.action === 'read';
-			});
+			const policies = await fetchPolicies(this.accountability, { knex: this.knex, schema: this.schema });
 
-			const allowedFieldsInCollection: Record<string, string[]> = {};
+			const permissions = await fetchPermissions(
+				collection
+					? {
+							action: 'read',
+							policies,
+							collections: [collection],
+							accountability: this.accountability,
+					  }
+					: {
+							action: 'read',
+							policies,
+							accountability: this.accountability,
+					  },
+				{ knex: this.knex, schema: this.schema },
+			);
+
+			const allowedFieldsInCollection: Record<string, Set<string>> = {};
 
 			permissions.forEach((permission) => {
-				allowedFieldsInCollection[permission.collection] = permission.fields ?? [];
+				if (!allowedFieldsInCollection[permission.collection]) {
+					allowedFieldsInCollection[permission.collection] = new Set();
+				}
+
+				for (const field of permission.fields ?? []) {
+					allowedFieldsInCollection[permission.collection]!.add(field);
+				}
 			});
 
 			if (collection && collection in allowedFieldsInCollection === false) {
-				throw new ForbiddenException();
+				throw new ForbiddenError();
 			}
 
 			return result.filter((field) => {
 				if (field.collection in allowedFieldsInCollection === false) return false;
-				const allowedFields = allowedFieldsInCollection[field.collection];
-				if (allowedFields[0] === '*') return true;
-				return allowedFields.includes(field.field);
+				const allowedFields = allowedFieldsInCollection[field.collection]!;
+				if (allowedFields.has('*')) return true;
+				return allowedFields.has(field.field);
 			});
 		}
 
@@ -177,6 +251,8 @@ export class FieldsService {
 			} else if (field.meta?.special?.includes('cast-datetime')) {
 				field.type = 'dateTime';
 			}
+
+			field.type = this.helpers.schema.processFieldType(field);
 		}
 
 		return result;
@@ -184,18 +260,38 @@ export class FieldsService {
 
 	async readOne(collection: string, field: string): Promise<Record<string, any>> {
 		if (this.accountability && this.accountability.admin !== true) {
-			if (this.hasReadAccess === false) {
-				throw new ForbiddenException();
+			await validateAccess(
+				{
+					accountability: this.accountability,
+					action: 'read',
+					collection,
+				},
+				{
+					schema: this.schema,
+					knex: this.knex,
+				},
+			);
+
+			const policies = await fetchPolicies(this.accountability, { knex: this.knex, schema: this.schema });
+
+			const permissions = await fetchPermissions(
+				{ action: 'read', policies, collections: [collection], accountability: this.accountability },
+				{ knex: this.knex, schema: this.schema },
+			);
+
+			let hasAccess = false;
+
+			for (const permission of permissions) {
+				if (permission.fields) {
+					if (permission.fields.includes('*') || permission.fields.includes(field)) {
+						hasAccess = true;
+						break;
+					}
+				}
 			}
 
-			const permissions = this.accountability.permissions!.find((permission) => {
-				return permission.action === 'read' && permission.collection === collection;
-			});
-
-			if (!permissions || !permissions.fields) throw new ForbiddenException();
-			if (permissions.fields.includes('*') === false) {
-				const allowedFields = permissions.fields;
-				if (allowedFields.includes(field) === false) throw new ForbiddenException();
+			if (!hasAccess) {
+				throw new ForbiddenError();
 			}
 		}
 
@@ -211,19 +307,19 @@ export class FieldsService {
 			systemFieldRows.find((fieldMeta) => fieldMeta.collection === collection && fieldMeta.field === field);
 
 		try {
-			column = await this.schemaInspector.columnInfo(collection, field);
+			column = await this.columnInfo(collection, field);
 		} catch {
 			// Do nothing
 		}
 
-		if (!column && !fieldInfo) throw new ForbiddenException();
+		if (!column && !fieldInfo) throw new ForbiddenError();
 
 		const type = getLocalType(column, fieldInfo);
 
 		const columnWithCastDefaultValue = column
 			? {
 					...column,
-					default_value: getDefaultValue(column),
+					default_value: getDefaultValue(column, fieldInfo),
 			  }
 			: null;
 
@@ -241,126 +337,198 @@ export class FieldsService {
 	async createField(
 		collection: string,
 		field: Partial<Field> & { field: string; type: Type | null },
-		table?: Knex.CreateTableBuilder // allows collection creation to
+		table?: Knex.CreateTableBuilder, // allows collection creation to
+		opts?: MutationOptions,
 	): Promise<void> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
+
+		const runPostColumnChange = await this.helpers.schema.preColumnChange();
+		const nestedActionEvents: ActionEventParams[] = [];
 
 		try {
 			const exists =
-				field.field in this.schema.collections[collection].fields ||
+				field.field in this.schema.collections[collection]!.fields ||
 				isNil(
-					await this.knex.select('id').from('directus_fields').where({ collection, field: field.field }).first()
+					await this.knex.select('id').from('directus_fields').where({ collection, field: field.field }).first(),
 				) === false;
 
 			// Check if field already exists, either as a column, or as a row in directus_fields
 			if (exists) {
-				throw new InvalidPayloadException(`Field "${field.field}" already exists in collection "${collection}"`);
+				throw new InvalidPayloadError({
+					reason: `Field "${field.field}" already exists in collection "${collection}"`,
+				});
 			}
 
 			// Add flag for specific database type overrides
 			const flagToAdd = this.helpers.date.fieldFlagForField(field.type);
+
 			if (flagToAdd) {
 				addFieldFlag(field, flagToAdd);
 			}
 
-			await this.knex.transaction(async (trx) => {
+			await transaction(this.knex, async (trx) => {
 				const itemsService = new ItemsService('directus_fields', {
 					knex: trx,
 					accountability: this.accountability,
 					schema: this.schema,
 				});
 
-				const hookAdjustedField = await emitter.emitFilter(
-					`fields.create`,
-					field,
-					{
-						collection: collection,
-					},
-					{
-						database: trx,
-						schema: this.schema,
-						accountability: this.accountability,
-					}
-				);
+				const hookAdjustedField =
+					opts?.emitEvents !== false
+						? await emitter.emitFilter(
+								`fields.create`,
+								field,
+								{
+									collection: collection,
+								},
+								{
+									database: trx,
+									schema: this.schema,
+									accountability: this.accountability,
+								},
+						  )
+						: field;
 
 				if (hookAdjustedField.type && ALIAS_TYPES.includes(hookAdjustedField.type) === false) {
 					if (table) {
-						this.addColumnToTable(table, hookAdjustedField as Field);
+						this.addColumnToTable(table, collection, hookAdjustedField as Field);
 					} else {
 						await trx.schema.alterTable(collection, (table) => {
-							this.addColumnToTable(table, hookAdjustedField as Field);
+							this.addColumnToTable(table, collection, hookAdjustedField as Field);
 						});
 					}
 				}
 
 				if (hookAdjustedField.meta) {
+					const existingSortRecord: Record<'max', number | null> | undefined = await trx
+						.from('directus_fields')
+						.where(hookAdjustedField.meta?.group ? { collection, group: hookAdjustedField.meta.group } : { collection })
+						.max('sort', { as: 'max' })
+						.first();
+
+					const newSortValue: number = existingSortRecord?.max ? existingSortRecord.max + 1 : 1;
+
 					await itemsService.createOne(
 						{
-							...hookAdjustedField.meta,
+							...merge({ sort: newSortValue }, hookAdjustedField.meta),
 							collection: collection,
 							field: hookAdjustedField.field,
 						},
-						{ emitEvents: false }
+						{ emitEvents: false },
 					);
 				}
 
-				emitter.emitAction(
-					`fields.create`,
-					{
+				const actionEvent = {
+					event: 'fields.create',
+					meta: {
 						payload: hookAdjustedField,
 						key: hookAdjustedField.field,
 						collection: collection,
 					},
-					{
+					context: {
 						database: getDatabase(),
 						schema: this.schema,
 						accountability: this.accountability,
-					}
-				);
+					},
+				};
+
+				if (opts?.bypassEmitAction) {
+					opts.bypassEmitAction(actionEvent);
+				} else {
+					nestedActionEvents.push(actionEvent);
+				}
 			});
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE) {
+			if (runPostColumnChange) {
+				await this.helpers.schema.postColumnChange();
+			}
+
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
-	async updateField(collection: string, field: RawField): Promise<string> {
+	async updateField(collection: string, field: RawField, opts?: MutationOptions): Promise<string> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
+		}
+
+		const runPostColumnChange = await this.helpers.schema.preColumnChange();
+		const nestedActionEvents: ActionEventParams[] = [];
+
+		// 'type' is required for further checks on schema update
+		if (field.schema && !field.type) {
+			const existingType = this.schema.collections[collection]?.fields[field.field]?.type;
+			if (existingType) field.type = existingType;
 		}
 
 		try {
-			const hookAdjustedField = await emitter.emitFilter(
-				`fields.update`,
-				field,
-				{
-					keys: [field.field],
-					collection: collection,
-				},
-				{
-					database: this.knex,
-					schema: this.schema,
-					accountability: this.accountability,
-				}
-			);
+			const hookAdjustedField =
+				opts?.emitEvents !== false
+					? await emitter.emitFilter(
+							`fields.update`,
+							field,
+							{
+								keys: [field.field],
+								collection: collection,
+							},
+							{
+								database: this.knex,
+								schema: this.schema,
+								accountability: this.accountability,
+							},
+					  )
+					: field;
 
 			const record = field.meta
 				? await this.knex.select('id').from('directus_fields').where({ collection, field: field.field }).first()
 				: null;
 
-			if (hookAdjustedField.schema) {
-				const existingColumn = await this.schemaInspector.columnInfo(collection, hookAdjustedField.field);
+			if (
+				hookAdjustedField.type &&
+				(hookAdjustedField.type === 'alias' ||
+					this.schema.collections[collection]!.fields[field.field]?.type === 'alias') &&
+				hookAdjustedField.type !== (this.schema.collections[collection]!.fields[field.field]?.type ?? 'alias')
+			) {
+				throw new InvalidPayloadError({ reason: 'Alias type cannot be changed' });
+			}
 
-				if (!isEqual(existingColumn, hookAdjustedField.schema)) {
+			if (hookAdjustedField.schema) {
+				const existingColumn = await this.columnInfo(collection, hookAdjustedField.field);
+
+				if (existingColumn.is_primary_key) {
+					if (hookAdjustedField.schema?.is_nullable === true) {
+						throw new InvalidPayloadError({ reason: 'Primary key cannot be null' });
+					}
+				}
+
+				// Sanitize column only when applying snapshot diff as opts is only passed from /utils/apply-diff.ts
+				const columnToCompare =
+					opts?.bypassLimits && opts.autoPurgeSystemCache === false ? sanitizeColumn(existingColumn) : existingColumn;
+
+				if (!isEqual(columnToCompare, hookAdjustedField.schema)) {
 					try {
-						await this.knex.schema.alterTable(collection, (table) => {
-							if (!hookAdjustedField.schema) return;
-							this.addColumnToTable(table, field, existingColumn);
+						await transaction(this.knex, async (trx) => {
+							await trx.schema.alterTable(collection, async (table) => {
+								if (!hookAdjustedField.schema) return;
+								this.addColumnToTable(table, collection, field, existingColumn);
+							});
 						});
 					} catch (err: any) {
 						throw await translateDatabaseError(err);
@@ -377,7 +545,7 @@ export class FieldsService {
 							collection: collection,
 							field: hookAdjustedField.field,
 						},
-						{ emitEvents: false }
+						{ emitEvents: false },
 					);
 				} else {
 					await this.itemsService.createOne(
@@ -386,55 +554,118 @@ export class FieldsService {
 							collection: collection,
 							field: hookAdjustedField.field,
 						},
-						{ emitEvents: false }
+						{ emitEvents: false },
 					);
 				}
 			}
 
-			emitter.emitAction(
-				`fields.update`,
-				{
+			const actionEvent = {
+				event: 'fields.update',
+				meta: {
 					payload: hookAdjustedField,
 					keys: [hookAdjustedField.field],
 					collection: collection,
 				},
-				{
+				context: {
 					database: getDatabase(),
 					schema: this.schema,
 					accountability: this.accountability,
-				}
-			);
+				},
+			};
+
+			if (opts?.bypassEmitAction) {
+				opts.bypassEmitAction(actionEvent);
+			} else {
+				nestedActionEvents.push(actionEvent);
+			}
 
 			return field.field;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE) {
+			if (runPostColumnChange) {
+				await this.helpers.schema.postColumnChange();
+			}
+
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
-	async deleteField(collection: string, field: string): Promise<void> {
-		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
-		}
+	async updateFields(collection: string, fields: RawField[], opts?: MutationOptions): Promise<string[]> {
+		const nestedActionEvents: ActionEventParams[] = [];
 
 		try {
-			await emitter.emitFilter(
-				'fields.delete',
-				[field],
-				{
-					collection: collection,
-				},
-				{
-					database: this.knex,
-					schema: this.schema,
-					accountability: this.accountability,
-				}
-			);
+			const fieldNames = [];
 
-			await this.knex.transaction(async (trx) => {
+			for (const field of fields) {
+				fieldNames.push(
+					await this.updateField(collection, field, {
+						autoPurgeCache: false,
+						autoPurgeSystemCache: false,
+						bypassEmitAction: (params) => nestedActionEvents.push(params),
+					}),
+				);
+			}
+
+			return fieldNames;
+		} finally {
+			if (shouldClearCache(this.cache, opts)) {
+				await this.cache.clear();
+			}
+
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
+		}
+	}
+
+	async deleteField(collection: string, field: string, opts?: MutationOptions): Promise<void> {
+		if (this.accountability && this.accountability.admin !== true) {
+			throw new ForbiddenError();
+		}
+
+		const runPostColumnChange = await this.helpers.schema.preColumnChange();
+		const nestedActionEvents: ActionEventParams[] = [];
+
+		try {
+			if (opts?.emitEvents !== false) {
+				await emitter.emitFilter(
+					'fields.delete',
+					[field],
+					{
+						collection: collection,
+					},
+					{
+						database: this.knex,
+						schema: this.schema,
+						accountability: this.accountability,
+					},
+				);
+			}
+
+			await transaction(this.knex, async (trx) => {
 				const relations = this.schema.relations.filter((relation) => {
 					return (
 						(relation.collection === collection && relation.field === field) ||
@@ -459,10 +690,24 @@ export class FieldsService {
 
 					// If the current field is a m2o, delete the related o2m if it exists and remove the relationship
 					if (isM2O) {
-						await relationsService.deleteOne(collection, field);
+						await relationsService.deleteOne(collection, field, {
+							autoPurgeSystemCache: false,
+							bypassEmitAction: (params) =>
+								opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+						});
 
-						if (relation.related_collection && relation.meta?.one_field) {
-							await fieldsService.deleteField(relation.related_collection, relation.meta.one_field);
+						if (
+							relation.related_collection &&
+							relation.meta?.one_field &&
+							relation.related_collection !== collection &&
+							relation.meta.one_field !== field
+						) {
+							await fieldsService.deleteField(relation.related_collection, relation.meta.one_field, {
+								autoPurgeCache: false,
+								autoPurgeSystemCache: false,
+								bypassEmitAction: (params) =>
+									opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+							});
 						}
 					}
 
@@ -477,8 +722,8 @@ export class FieldsService {
 				// Delete field only after foreign key constraints are removed
 				if (
 					this.schema.collections[collection] &&
-					field in this.schema.collections[collection].fields &&
-					this.schema.collections[collection].fields[field].alias === false
+					field in this.schema.collections[collection]!.fields &&
+					this.schema.collections[collection]!.fields[field]!.alias === false
 				) {
 					await trx.schema.table(collection, (table) => {
 						table.dropColumn(field);
@@ -494,11 +739,11 @@ export class FieldsService {
 				const collectionMetaUpdates: Record<string, null> = {};
 
 				if (collectionMeta?.archive_field === field) {
-					collectionMetaUpdates.archive_field = null;
+					collectionMetaUpdates['archive_field'] = null;
 				}
 
 				if (collectionMeta?.sort_field === field) {
-					collectionMetaUpdates.sort_field = null;
+					collectionMetaUpdates['sort_field'] = null;
 				}
 
 				if (Object.keys(collectionMetaUpdates).length > 0) {
@@ -519,31 +764,71 @@ export class FieldsService {
 						.where({ group: metaRow.field, collection: metaRow.collection });
 				}
 
-				await trx('directus_fields').delete().where({ collection, field });
+				const itemsService = new ItemsService('directus_fields', {
+					knex: trx,
+					accountability: this.accountability,
+					schema: this.schema,
+				});
+
+				await itemsService.deleteByQuery(
+					{
+						filter: {
+							collection: { _eq: collection },
+							field: { _eq: field },
+						},
+					},
+					{ emitEvents: false },
+				);
 			});
 
-			emitter.emitAction(
-				'fields.delete',
-				{
+			const actionEvent = {
+				event: 'fields.delete',
+				meta: {
 					payload: [field],
 					collection: collection,
 				},
-				{
+				context: {
 					database: this.knex,
 					schema: this.schema,
 					accountability: this.accountability,
-				}
-			);
+				},
+			};
+
+			if (opts?.bypassEmitAction) {
+				opts.bypassEmitAction(actionEvent);
+			} else {
+				nestedActionEvents.push(actionEvent);
+			}
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE) {
+			if (runPostColumnChange) {
+				await this.helpers.schema.postColumnChange();
+			}
+
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
-	public addColumnToTable(table: Knex.CreateTableBuilder, field: RawField | Field, alter: Column | null = null): void {
+	public addColumnToTable(
+		table: Knex.CreateTableBuilder,
+		collection: string,
+		field: RawField | Field,
+		existing: Column | null = null,
+	): void {
 		let column: Knex.ColumnBuilder;
 
 		// Don't attempt to add a DB column for alias / corrupt fields
@@ -551,7 +836,6 @@ export class FieldsService {
 
 		if (field.schema?.has_auto_increment) {
 			if (field.type === 'bigInteger') {
-				// Create an auto-incremented big integer (MySQL, PostgreSQL) or an auto-incremented integer (other DBs)
 				column = table.bigIncrements(field.field);
 			} else {
 				column = table.increments(field.field);
@@ -560,9 +844,14 @@ export class FieldsService {
 			column = table.string(field.field, field.schema?.max_length ?? undefined);
 		} else if (['float', 'decimal'].includes(field.type)) {
 			const type = field.type as 'float' | 'decimal';
-			column = table[type](field.field, field.schema?.numeric_precision || 10, field.schema?.numeric_scale || 5);
+
+			column = table[type](
+				field.field,
+				field.schema?.numeric_precision ?? DEFAULT_NUMERIC_PRECISION,
+				field.schema?.numeric_scale ?? DEFAULT_NUMERIC_SCALE,
+			);
 		} else if (field.type === 'csv') {
-			column = table.string(field.field);
+			column = table.text(field.field);
 		} else if (field.type === 'hash') {
 			column = table.string(field.field, 255);
 		} else if (field.type === 'dateTime') {
@@ -571,53 +860,92 @@ export class FieldsService {
 			column = table.timestamp(field.field, { useTz: true });
 		} else if (field.type.startsWith('geometry')) {
 			column = this.helpers.st.createColumn(table, field);
-		} else if (KNEX_TYPES.includes(field.type as typeof KNEX_TYPES[number])) {
-			column = table[field.type as typeof KNEX_TYPES[number]](field.field);
+		} else if (KNEX_TYPES.includes(field.type as (typeof KNEX_TYPES)[number])) {
+			column = table[field.type as (typeof KNEX_TYPES)[number]](field.field);
 		} else {
-			throw new InvalidPayloadException(`Illegal type passed: "${field.type}"`);
+			throw new InvalidPayloadError({ reason: `Illegal type passed: "${field.type}"` });
 		}
 
-		if (field.schema?.default_value !== undefined) {
-			if (
-				typeof field.schema.default_value === 'string' &&
-				(field.schema.default_value.toLowerCase() === 'now()' || field.schema.default_value === 'CURRENT_TIMESTAMP')
-			) {
+		const setDefaultValue = (defaultValue: string | number | boolean | null) => {
+			const newDefaultValueIsString = typeof defaultValue === 'string';
+			const newDefaultIsNowFunction = newDefaultValueIsString && defaultValue.toLowerCase() === 'now()';
+			const newDefaultIsCurrentTimestamp = newDefaultValueIsString && defaultValue === 'CURRENT_TIMESTAMP';
+			const newDefaultIsSetToCurrentTime = newDefaultIsNowFunction || newDefaultIsCurrentTimestamp;
+			const newDefaultIsAFunction = newDefaultValueIsString && ALLOWED_DB_DEFAULT_FUNCTIONS.includes(defaultValue);
+
+			const newDefaultIsTimestampWithPrecision =
+				newDefaultValueIsString && defaultValue.includes('CURRENT_TIMESTAMP(') && defaultValue.includes(')');
+
+			if (newDefaultIsSetToCurrentTime) {
 				column.defaultTo(this.knex.fn.now());
-			} else if (
-				typeof field.schema.default_value === 'string' &&
-				field.schema.default_value.includes('CURRENT_TIMESTAMP(') &&
-				field.schema.default_value.includes(')')
-			) {
-				const precision = field.schema.default_value.match(REGEX_BETWEEN_PARENS)![1];
+			} else if (newDefaultIsTimestampWithPrecision) {
+				const precision = defaultValue.match(REGEX_BETWEEN_PARENS)![1];
 				column.defaultTo(this.knex.fn.now(Number(precision)));
+			} else if (newDefaultIsAFunction) {
+				column.defaultTo(this.knex.raw(defaultValue));
 			} else {
-				column.defaultTo(field.schema.default_value);
+				column.defaultTo(defaultValue);
 			}
-		}
+		};
 
-		if (field.schema?.is_nullable === false) {
-			if (!alter || alter.is_nullable === true) {
+		// for a new item, set the default value and nullable as provided without any further considerations
+		if (!existing) {
+			if (field.schema?.default_value !== undefined) {
+				setDefaultValue(field.schema.default_value);
+			}
+
+			if (field.schema?.is_nullable || field.schema?.is_nullable === undefined) {
+				column.nullable();
+			} else {
 				column.notNullable();
 			}
 		} else {
-			if (!alter || alter.is_nullable === false) {
-				column.nullable();
+			// for an existing item: if nullable option changed, we have to provide the default values as well and actually vice versa
+			// see https://knexjs.org/guide/schema-builder.html#alter
+			// To overwrite a nullable option with the same value this is not possible for Oracle though, hence the DB helper
+
+			if (field.schema?.default_value !== undefined || field.schema?.is_nullable !== undefined) {
+				this.helpers.nullableUpdate.updateNullableValue(column, field, existing);
+
+				let defaultValue = null;
+
+				if (field.schema?.default_value !== undefined) {
+					defaultValue = field.schema.default_value;
+				} else if (existing.default_value !== undefined) {
+					defaultValue = existing.default_value;
+				}
+
+				setDefaultValue(defaultValue);
 			}
 		}
 
 		if (field.schema?.is_primary_key) {
 			column.primary().notNullable();
-		} else if (field.schema?.is_unique === true) {
-			if (!alter || alter.is_unique === false) {
-				column.unique();
+		} else if (!existing?.is_primary_key) {
+			// primary key will already have unique/index constraints
+
+			const uniqueIndexName = this.helpers.schema.generateIndexName('unique', collection, field.field);
+
+			if (field.schema?.is_unique === true) {
+				if (!existing || existing.is_unique === false) {
+					column.unique({ indexName: uniqueIndexName });
+				}
+			} else if (field.schema?.is_unique === false) {
+				if (existing && existing.is_unique === true) {
+					table.dropUnique([field.field], uniqueIndexName);
+				}
 			}
-		} else if (field.schema?.is_unique === false) {
-			if (alter && alter.is_unique === true) {
-				table.dropUnique([field.field]);
+
+			const indexName: string = this.helpers.schema.generateIndexName('index', collection, field.field);
+
+			if (field.schema?.is_indexed === true && !existing?.is_indexed) {
+				column.index(indexName);
+			} else if (field.schema?.is_indexed === false && existing?.is_indexed) {
+				table.dropIndex([field.field], indexName);
 			}
 		}
 
-		if (alter) {
+		if (existing) {
 			column.alter();
 		}
 	}

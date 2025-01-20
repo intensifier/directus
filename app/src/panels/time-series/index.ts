@@ -1,15 +1,44 @@
+import { useCollectionsStore } from '@/stores/collections';
 import { getGroups } from '@/utils/get-groups';
-import { definePanel } from '@directus/shared/utils';
+import { definePanel } from '@directus/extensions';
+import { Filter } from '@directus/types';
 import PanelTimeSeries from './panel-time-series.vue';
+import PreviewSVG from './preview.svg?raw';
 
 export default definePanel({
 	id: 'time-series',
 	name: '$t:panels.time_series.name',
 	description: '$t:panels.time_series.description',
 	icon: 'show_chart',
+	preview: PreviewSVG,
 	query(options) {
 		if (!options?.function || !options.valueField || !options.dateField) {
 			return;
+		}
+
+		const collectionsStore = useCollectionsStore();
+		const collectionInfo = collectionsStore.getCollection(options.collection);
+
+		if (!collectionInfo) return;
+		if (collectionInfo?.meta?.singleton) return;
+
+		const filter: Filter = {
+			_and: [getParsedOptionsFilter(options.filter)],
+		};
+
+		if (options.range !== 'auto') {
+			filter._and.push(
+				{
+					[options.dateField]: {
+						_gte: `$NOW(-${options.range || '1 week'})`,
+					},
+				},
+				{
+					[options.dateField]: {
+						_lte: `$NOW`,
+					},
+				},
+			);
 		}
 
 		return {
@@ -19,24 +48,20 @@ export default definePanel({
 				aggregate: {
 					[options.function]: [options.valueField],
 				},
-				filter: {
-					_and: [
-						{
-							[options.dateField]: {
-								_gte: `$NOW(-${options.range || '1 week'})`,
-							},
-						},
-						{
-							[options.dateField]: {
-								_lte: `$NOW`,
-							},
-						},
-						options.filter || {},
-					],
-				},
+				filter,
 				limit: -1,
 			},
 		};
+
+		function getParsedOptionsFilter(filter: string | undefined) {
+			if (!filter) return {};
+
+			try {
+				return JSON.parse(filter);
+			} catch {
+				return filter;
+			}
+		}
 	},
 	component: PanelTimeSeries,
 	options: [
@@ -48,6 +73,7 @@ export default definePanel({
 				interface: 'system-collection',
 				options: {
 					includeSystem: true,
+					includeSingleton: false,
 				},
 				width: 'half',
 			},
@@ -176,6 +202,10 @@ export default definePanel({
 				options: {
 					choices: [
 						{
+							text: 'Automatic (Based on data)',
+							value: 'auto',
+						},
+						{
 							text: 'Past 5 Minutes',
 							value: '5 minutes',
 						},
@@ -228,6 +258,7 @@ export default definePanel({
 				interface: 'system-field',
 				width: 'half',
 				options: {
+					allowForeignKeys: false,
 					collectionField: 'collection',
 					typeAllowList: ['integer', 'bigInteger', 'float', 'decimal'],
 				},
@@ -240,6 +271,7 @@ export default definePanel({
 						},
 						options: {
 							allowPrimaryKey: true,
+							allowForeignKeys: true,
 							typeAllowList: ['integer', 'bigInteger', 'uuid', 'string'],
 						},
 					},
@@ -349,6 +381,7 @@ export default definePanel({
 				interface: 'system-filter',
 				options: {
 					collectionField: 'collection',
+					relationalFieldSelectable: false,
 				},
 			},
 		},

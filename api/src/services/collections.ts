@@ -1,32 +1,40 @@
-import SchemaInspector from '@directus/schema';
-import { Knex } from 'knex';
-import { getCache, clearSystemCache } from '../cache';
-import { ALIAS_TYPES } from '../constants';
-import getDatabase, { getSchemaInspector } from '../database';
-import { systemCollectionRows } from '../database/system-data/collections';
-import env from '../env';
-import { ForbiddenException, InvalidPayloadException } from '../exceptions';
-import { FieldsService } from '../services/fields';
-import { ItemsService } from '../services/items';
-import Keyv from 'keyv';
-import { AbstractServiceOptions, Collection, CollectionMeta, MutationOptions } from '../types';
-import { Accountability, FieldMeta, RawField, SchemaOverview } from '@directus/shared/types';
-import { Table } from 'knex-schema-inspector/dist/types/table';
-import { addFieldFlag } from '@directus/shared/utils';
-import { getHelpers, Helpers } from '../database/helpers';
+import { useEnv } from '@directus/env';
+import { ForbiddenError, InvalidPayloadError } from '@directus/errors';
+import type { SchemaInspector, Table } from '@directus/schema';
+import { createInspector } from '@directus/schema';
+import { systemCollectionRows, type BaseCollectionMeta } from '@directus/system-data';
+import type { Accountability, FieldMeta, RawField, SchemaOverview } from '@directus/types';
+import { addFieldFlag } from '@directus/utils';
+import type Keyv from 'keyv';
+import type { Knex } from 'knex';
+import { chunk, groupBy, merge, omit } from 'lodash-es';
+import { clearSystemCache, getCache } from '../cache.js';
+import { ALIAS_TYPES } from '../constants.js';
+import type { Helpers } from '../database/helpers/index.js';
+import { getHelpers } from '../database/helpers/index.js';
+import getDatabase, { getSchemaInspector } from '../database/index.js';
+import emitter from '../emitter.js';
+import { fetchAllowedCollections } from '../permissions/modules/fetch-allowed-collections/fetch-allowed-collections.js';
+import { validateAccess } from '../permissions/modules/validate-access/validate-access.js';
+import type { AbstractServiceOptions, ActionEventParams, Collection, MutationOptions } from '../types/index.js';
+import { getSchema } from '../utils/get-schema.js';
+import { shouldClearCache } from '../utils/should-clear-cache.js';
+import { transaction } from '../utils/transaction.js';
+import { FieldsService } from './fields.js';
+import { ItemsService } from './items.js';
 
 export type RawCollection = {
 	collection: string;
 	fields?: RawField[];
 	schema?: Partial<Table> | null;
-	meta?: Partial<CollectionMeta> | null;
+	meta?: Partial<BaseCollectionMeta> | null;
 };
 
 export class CollectionsService {
 	knex: Knex;
 	helpers: Helpers;
 	accountability: Accountability | null;
-	schemaInspector: ReturnType<typeof SchemaInspector>;
+	schemaInspector: SchemaInspector;
 	schema: SchemaOverview;
 	cache: Keyv<any> | null;
 	systemCache: Keyv<any>;
@@ -35,7 +43,7 @@ export class CollectionsService {
 		this.knex = options.knex || getDatabase();
 		this.helpers = getHelpers(this.knex);
 		this.accountability = options.accountability || null;
-		this.schemaInspector = options.knex ? SchemaInspector(options.knex) : getSchemaInspector();
+		this.schemaInspector = options.knex ? createInspector(options.knex) : getSchemaInspector();
 		this.schema = options.schema;
 
 		const { cache, systemCache } = getCache();
@@ -48,14 +56,16 @@ export class CollectionsService {
 	 */
 	async createOne(payload: RawCollection, opts?: MutationOptions): Promise<string> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
 
-		if (!payload.collection) throw new InvalidPayloadException(`"collection" is required`);
+		if (!payload.collection) throw new InvalidPayloadError({ reason: `"collection" is required` });
 
 		if (payload.collection.startsWith('directus_')) {
-			throw new InvalidPayloadException(`Collections can't start with "directus_"`);
+			throw new InvalidPayloadError({ reason: `Collections can't start with "directus_"` });
 		}
+
+		const nestedActionEvents: ActionEventParams[] = [];
 
 		try {
 			const existingCollections: string[] = [
@@ -65,18 +75,18 @@ export class CollectionsService {
 			];
 
 			if (existingCollections.includes(payload.collection)) {
-				throw new InvalidPayloadException(`Collection "${payload.collection}" already exists.`);
+				throw new InvalidPayloadError({ reason: `Collection "${payload.collection}" already exists` });
 			}
 
 			// Create the collection/fields in a transaction so it'll be reverted in case of errors or
 			// permission problems. This might not work reliably in MySQL, as it doesn't support DDL in
 			// transactions.
-			await this.knex.transaction(async (trx) => {
+			await transaction(this.knex, async (trx) => {
 				if (payload.schema) {
 					// Directus heavily relies on the primary key of a collection, so we have to make sure that
 					// every collection that is created has a primary key. If no primary key field is created
 					// while making the collection, we default to an auto incremented id named `id`
-					if (!payload.fields)
+					if (!payload.fields) {
 						payload.fields = [
 							{
 								field: 'id',
@@ -92,6 +102,7 @@ export class CollectionsService {
 								},
 							},
 						];
+					}
 
 					// Ensure that every field meta has the field/collection fields filled correctly
 					payload.fields = payload.fields.map((field) => {
@@ -105,6 +116,7 @@ export class CollectionsService {
 
 						// Add flag for specific database type overrides
 						const flagToAdd = this.helpers.date.fieldFlagForField(field.type);
+
 						if (flagToAdd) {
 							addFieldFlag(field, flagToAdd);
 						}
@@ -117,7 +129,7 @@ export class CollectionsService {
 					await trx.schema.createTable(payload.collection, (table) => {
 						for (const field of payload.fields!) {
 							if (field.type && ALIAS_TYPES.includes(field.type) === false) {
-								fieldsService.addColumnToTable(table, field);
+								fieldsService.addColumnToTable(table, payload.collection, field);
 							}
 						}
 					});
@@ -129,20 +141,54 @@ export class CollectionsService {
 					});
 
 					const fieldPayloads = payload.fields!.filter((field) => field.meta).map((field) => field.meta) as FieldMeta[];
-					await fieldItemsService.createMany(fieldPayloads);
+
+					// Sort new fields that does not have any group defined, in ascending order.
+					// Lodash merge is used so that the "sort" can be overridden if defined.
+					let sortedFieldPayloads = fieldPayloads
+						.filter((field) => field?.group === undefined || field?.group === null)
+						.map((field, index) => merge({ sort: index + 1 }, field));
+
+					// Sort remaining new fields with group defined, if any, in ascending order.
+					// sortedFieldPayloads will be less than fieldPayloads if it filtered out any fields with group defined.
+					if (sortedFieldPayloads.length < fieldPayloads.length) {
+						const fieldsWithGroups = groupBy(
+							fieldPayloads.filter((field) => field?.group),
+							(field) => field?.group,
+						);
+
+						// The sort order is restarted from 1 for fields in each group and appended to sortedFieldPayloads.
+						// Lodash merge is used so that the "sort" can be overridden if defined.
+						for (const [_group, fields] of Object.entries(fieldsWithGroups)) {
+							sortedFieldPayloads = sortedFieldPayloads.concat(
+								fields.map((field, index) => merge({ sort: index + 1 }, field)),
+							);
+						}
+					}
+
+					await fieldItemsService.createMany(sortedFieldPayloads, {
+						bypassEmitAction: (params) =>
+							opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+						bypassLimits: true,
+					});
 				}
 
 				if (payload.meta) {
-					const collectionItemsService = new ItemsService('directus_collections', {
+					const collectionsItemsService = new ItemsService('directus_collections', {
 						knex: trx,
 						accountability: this.accountability,
 						schema: this.schema,
 					});
 
-					await collectionItemsService.createOne({
-						...payload.meta,
-						collection: payload.collection,
-					});
+					await collectionsItemsService.createOne(
+						{
+							...payload.meta,
+							collection: payload.collection,
+						},
+						{
+							bypassEmitAction: (params) =>
+								opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+						},
+					);
 				}
 
 				return payload.collection;
@@ -150,11 +196,22 @@ export class CollectionsService {
 
 			return payload.collection;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
@@ -162,8 +219,10 @@ export class CollectionsService {
 	 * Create multiple new collections
 	 */
 	async createMany(payloads: RawCollection[], opts?: MutationOptions): Promise<string[]> {
+		const nestedActionEvents: ActionEventParams[] = [];
+
 		try {
-			const collections = await this.knex.transaction(async (trx) => {
+			const collections = await transaction(this.knex, async (trx) => {
 				const service = new CollectionsService({
 					schema: this.schema,
 					accountability: this.accountability,
@@ -173,7 +232,12 @@ export class CollectionsService {
 				const collectionNames: string[] = [];
 
 				for (const payload of payloads) {
-					const name = await service.createOne(payload, { autoPurgeCache: false });
+					const name = await service.createOne(payload, {
+						autoPurgeCache: false,
+						autoPurgeSystemCache: false,
+						bypassEmitAction: (params) => nestedActionEvents.push(params),
+					});
+
 					collectionNames.push(name);
 				}
 
@@ -182,11 +246,22 @@ export class CollectionsService {
 
 			return collections;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
@@ -194,7 +269,9 @@ export class CollectionsService {
 	 * Read all collections. Currently doesn't support any query.
 	 */
 	async readByQuery(): Promise<Collection[]> {
-		const collectionItemsService = new ItemsService('directus_collections', {
+		const env = useEnv();
+
+		const collectionsItemsService = new ItemsService('directus_collections', {
 			knex: this.knex,
 			schema: this.schema,
 			accountability: this.accountability,
@@ -202,9 +279,9 @@ export class CollectionsService {
 
 		let tablesInDatabase = await this.schemaInspector.tableInfo();
 
-		let meta = (await collectionItemsService.readByQuery({
+		let meta = (await collectionsItemsService.readByQuery({
 			limit: -1,
-		})) as CollectionMeta[];
+		})) as BaseCollectionMeta[];
 
 		meta.push(...systemCollectionRows);
 
@@ -214,14 +291,19 @@ export class CollectionsService {
 					...meta,
 					[item.collection]: item.group,
 				}),
-				{}
+				{},
 			);
 
-			let collectionsYouHavePermissionToRead: string[] = this.accountability
-				.permissions!.filter((permission) => {
-					return permission.action === 'read';
-				})
-				.map(({ collection }) => collection);
+			let collectionsYouHavePermissionToRead = await fetchAllowedCollections(
+				{
+					accountability: this.accountability,
+					action: 'read',
+				},
+				{
+					knex: this.knex,
+					schema: this.schema,
+				},
+			);
 
 			for (const collection of collectionsYouHavePermissionToRead) {
 				const group = collectionsGroups[collection];
@@ -264,8 +346,10 @@ export class CollectionsService {
 			}
 		}
 
-		if (env.DB_EXCLUDE_TABLES) {
-			return collections.filter((collection) => env.DB_EXCLUDE_TABLES.includes(collection.collection) === false);
+		if (env['DB_EXCLUDE_TABLES']) {
+			return collections.filter(
+				(collection) => (env['DB_EXCLUDE_TABLES'] as string[]).includes(collection.collection) === false,
+			);
 		}
 
 		return collections;
@@ -277,29 +361,32 @@ export class CollectionsService {
 	async readOne(collectionKey: string): Promise<Collection> {
 		const result = await this.readMany([collectionKey]);
 
-		if (result.length === 0) throw new ForbiddenException();
+		if (result.length === 0) throw new ForbiddenError();
 
-		return result[0];
+		return result[0]!;
 	}
 
 	/**
 	 * Read many collections by name
 	 */
 	async readMany(collectionKeys: string[]): Promise<Collection[]> {
-		if (this.accountability && this.accountability.admin !== true) {
-			const permissions = this.accountability.permissions!.filter((permission) => {
-				return permission.action === 'read' && collectionKeys.includes(permission.collection);
-			});
-
-			if (collectionKeys.length !== permissions.length) {
-				const collectionsYouHavePermissionToRead = permissions.map(({ collection }) => collection);
-
-				for (const collectionKey of collectionKeys) {
-					if (collectionsYouHavePermissionToRead.includes(collectionKey) === false) {
-						throw new ForbiddenException();
-					}
-				}
-			}
+		if (this.accountability) {
+			await Promise.all(
+				collectionKeys.map((collection) =>
+					validateAccess(
+						{
+							accountability: this.accountability!,
+							action: 'read',
+							collection,
+							skipCollectionExistsCheck: true,
+						},
+						{
+							schema: this.schema,
+							knex: this.knex,
+						},
+					),
+				),
+			);
 		}
 
 		const collections = await this.readByQuery();
@@ -311,11 +398,13 @@ export class CollectionsService {
 	 */
 	async updateOne(collectionKey: string, data: Partial<Collection>, opts?: MutationOptions): Promise<string> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
 
+		const nestedActionEvents: ActionEventParams[] = [];
+
 		try {
-			const collectionItemsService = new ItemsService('directus_collections', {
+			const collectionsItemsService = new ItemsService('directus_collections', {
 				knex: this.knex,
 				accountability: this.accountability,
 				schema: this.schema,
@@ -334,19 +423,102 @@ export class CollectionsService {
 				.first());
 
 			if (exists) {
-				await collectionItemsService.updateOne(collectionKey, payload.meta, opts);
+				await collectionsItemsService.updateOne(collectionKey, payload.meta, {
+					...opts,
+					bypassEmitAction: (params) =>
+						opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+				});
 			} else {
-				await collectionItemsService.createOne({ ...payload.meta, collection: collectionKey }, opts);
+				await collectionsItemsService.createOne(
+					{ ...payload.meta, collection: collectionKey },
+					{
+						...opts,
+						bypassEmitAction: (params) =>
+							opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+					},
+				);
 			}
 
 			return collectionKey;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
+	}
+
+	/**
+	 * Update multiple collections in a single transaction
+	 */
+	async updateBatch(data: Partial<Collection>[], opts?: MutationOptions): Promise<string[]> {
+		if (this.accountability && this.accountability.admin !== true) {
+			throw new ForbiddenError();
+		}
+
+		if (!Array.isArray(data)) {
+			throw new InvalidPayloadError({ reason: 'Input should be an array of collection changes' });
+		}
+
+		const collectionKey = 'collection';
+		const collectionKeys: string[] = [];
+		const nestedActionEvents: ActionEventParams[] = [];
+
+		try {
+			await transaction(this.knex, async (trx) => {
+				const collectionItemsService = new CollectionsService({
+					knex: trx,
+					accountability: this.accountability,
+					schema: this.schema,
+				});
+
+				for (const payload of data) {
+					if (!payload[collectionKey]) {
+						throw new InvalidPayloadError({ reason: `Collection in update misses collection key` });
+					}
+
+					await collectionItemsService.updateOne(payload[collectionKey], omit(payload, collectionKey), {
+						autoPurgeCache: false,
+						autoPurgeSystemCache: false,
+						bypassEmitAction: (params) =>
+							opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+					});
+
+					collectionKeys.push(payload[collectionKey]);
+				}
+			});
+		} finally {
+			if (shouldClearCache(this.cache, opts)) {
+				await this.cache.clear();
+			}
+
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
+		}
+
+		return collectionKeys;
 	}
 
 	/**
@@ -354,11 +526,13 @@ export class CollectionsService {
 	 */
 	async updateMany(collectionKeys: string[], data: Partial<Collection>, opts?: MutationOptions): Promise<string[]> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
 
+		const nestedActionEvents: ActionEventParams[] = [];
+
 		try {
-			await this.knex.transaction(async (trx) => {
+			await transaction(this.knex, async (trx) => {
 				const service = new CollectionsService({
 					schema: this.schema,
 					accountability: this.accountability,
@@ -366,17 +540,32 @@ export class CollectionsService {
 				});
 
 				for (const collectionKey of collectionKeys) {
-					await service.updateOne(collectionKey, data, { autoPurgeCache: false });
+					await service.updateOne(collectionKey, data, {
+						autoPurgeCache: false,
+						autoPurgeSystemCache: false,
+						bypassEmitAction: (params) => nestedActionEvents.push(params),
+					});
 				}
 			});
 
 			return collectionKeys;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
@@ -386,8 +575,10 @@ export class CollectionsService {
 	 */
 	async deleteOne(collectionKey: string, opts?: MutationOptions): Promise<string> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
+
+		const nestedActionEvents: ActionEventParams[] = [];
 
 		try {
 			const collections = await this.readByQuery();
@@ -395,10 +586,10 @@ export class CollectionsService {
 			const collectionToBeDeleted = collections.find((collection) => collection.collection === collectionKey);
 
 			if (!!collectionToBeDeleted === false) {
-				throw new ForbiddenException();
+				throw new ForbiddenError();
 			}
 
-			await this.knex.transaction(async (trx) => {
+			await transaction(this.knex, async (trx) => {
 				if (collectionToBeDeleted!.schema) {
 					await trx.schema.dropTable(collectionKey);
 				}
@@ -407,13 +598,16 @@ export class CollectionsService {
 				await trx('directus_collections').update({ group: null }).where({ group: collectionKey });
 
 				if (collectionToBeDeleted!.meta) {
-					const collectionItemsService = new ItemsService('directus_collections', {
+					const collectionsItemsService = new ItemsService('directus_collections', {
 						knex: trx,
 						accountability: this.accountability,
 						schema: this.schema,
 					});
 
-					await collectionItemsService.deleteOne(collectionKey);
+					await collectionsItemsService.deleteOne(collectionKey, {
+						bypassEmitAction: (params) =>
+							opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+					});
 				}
 
 				if (collectionToBeDeleted!.schema) {
@@ -432,8 +626,14 @@ export class CollectionsService {
 						.where({ collection: collectionKey });
 
 					if (revisionsToDelete.length > 0) {
-						const keys = revisionsToDelete.map((record) => record.id);
-						await trx('directus_revisions').update({ parent: null }).whereIn('parent', keys);
+						const chunks = chunk(
+							revisionsToDelete.map((record) => record.id),
+							10000,
+						);
+
+						for (const keys of chunks) {
+							await trx('directus_revisions').update({ parent: null }).whereIn('parent', keys);
+						}
 					}
 
 					await trx('directus_revisions').delete().where('collection', '=', collectionKey);
@@ -449,12 +649,22 @@ export class CollectionsService {
 					for (const relation of relations) {
 						// Delete related o2m fields that point to current collection
 						if (relation.related_collection && relation.meta?.one_field) {
-							await fieldsService.deleteField(relation.related_collection, relation.meta.one_field);
+							await fieldsService.deleteField(relation.related_collection, relation.meta.one_field, {
+								autoPurgeCache: false,
+								autoPurgeSystemCache: false,
+								bypassEmitAction: (params) =>
+									opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+							});
 						}
 
 						// Delete related m2o fields that point to current collection
 						if (relation.related_collection === collectionKey) {
-							await fieldsService.deleteField(relation.collection, relation.field);
+							await fieldsService.deleteField(relation.collection, relation.field, {
+								autoPurgeCache: false,
+								autoPurgeSystemCache: false,
+								bypassEmitAction: (params) =>
+									opts?.bypassEmitAction ? opts.bypassEmitAction(params) : nestedActionEvents.push(params),
+							});
 						}
 					}
 
@@ -466,6 +676,7 @@ export class CollectionsService {
 						const newAllowedCollections = relation
 							.meta!.one_allowed_collections!.filter((collection) => collectionKey !== collection)
 							.join(',');
+
 						await trx('directus_relations')
 							.update({ one_allowed_collections: newAllowedCollections })
 							.where({ id: relation.meta!.id });
@@ -475,11 +686,22 @@ export class CollectionsService {
 
 			return collectionKey;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 
@@ -488,11 +710,13 @@ export class CollectionsService {
 	 */
 	async deleteMany(collectionKeys: string[], opts?: MutationOptions): Promise<string[]> {
 		if (this.accountability && this.accountability.admin !== true) {
-			throw new ForbiddenException();
+			throw new ForbiddenError();
 		}
 
+		const nestedActionEvents: ActionEventParams[] = [];
+
 		try {
-			await this.knex.transaction(async (trx) => {
+			await transaction(this.knex, async (trx) => {
 				const service = new CollectionsService({
 					schema: this.schema,
 					accountability: this.accountability,
@@ -500,17 +724,32 @@ export class CollectionsService {
 				});
 
 				for (const collectionKey of collectionKeys) {
-					await service.deleteOne(collectionKey, { autoPurgeCache: false });
+					await service.deleteOne(collectionKey, {
+						autoPurgeCache: false,
+						autoPurgeSystemCache: false,
+						bypassEmitAction: (params) => nestedActionEvents.push(params),
+					});
 				}
 			});
 
 			return collectionKeys;
 		} finally {
-			if (this.cache && env.CACHE_AUTO_PURGE && opts?.autoPurgeCache !== false) {
+			if (shouldClearCache(this.cache, opts)) {
 				await this.cache.clear();
 			}
 
-			await clearSystemCache();
+			if (opts?.autoPurgeSystemCache !== false) {
+				await clearSystemCache({ autoPurgeCache: opts?.autoPurgeCache });
+			}
+
+			if (opts?.emitEvents !== false && nestedActionEvents.length > 0) {
+				const updatedSchema = await getSchema();
+
+				for (const nestedActionEvent of nestedActionEvents) {
+					nestedActionEvent.context.schema = updatedSchema;
+					emitter.emitAction(nestedActionEvent.event, nestedActionEvent.meta, nestedActionEvent.context);
+				}
+			}
 		}
 	}
 }

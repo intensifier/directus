@@ -1,26 +1,14 @@
-import { getDisplays } from '@/displays';
-import { getInterfaces } from '@/interfaces';
-import { getPanels } from '@/panels';
-import { getLayouts } from '@/layouts';
-import { getModules } from '@/modules';
-import { useCollectionsStore, useFieldsStore } from '@/stores';
-import { translate } from '@/utils/translate-object-values';
+import { useCollectionsStore } from '@/stores/collections';
+import { useFieldsStore } from '@/stores/fields';
+import { useTranslationsStore } from '@/stores/translations';
+import { loadDateFNSLocale } from '@/utils/get-date-fns-locale';
 import availableLanguages from './available-languages.yaml';
 import { i18n, Language, loadedLanguages } from './index';
-import { getOperations } from '@/operations';
-import { useTranslationStrings } from '@/composables/use-translation-strings';
-const { modules, modulesRaw } = getModules();
-const { layouts, layoutsRaw } = getLayouts();
-const { interfaces, interfacesRaw } = getInterfaces();
-const { panels, panelsRaw } = getPanels();
-const { displays, displaysRaw } = getDisplays();
-const { operations, operationsRaw } = getOperations();
-import { loadDateFNSLocale } from '@/utils/get-date-fns-locale';
 
 export async function setLanguage(lang: Language): Promise<boolean> {
 	const collectionsStore = useCollectionsStore();
 	const fieldsStore = useFieldsStore();
-	const { mergeTranslationStringsForLanguage } = useTranslationStrings();
+	const translationsStore = useTranslationsStore();
 
 	if (Object.keys(availableLanguages).includes(lang) === false) {
 		// eslint-disable-next-line no-console
@@ -42,18 +30,17 @@ export async function setLanguage(lang: Language): Promise<boolean> {
 		(document.querySelector('html') as HTMLElement).setAttribute('lang', lang);
 	}
 
-	modules.value = translate(modulesRaw.value);
-	layouts.value = translate(layoutsRaw.value);
-	interfaces.value = translate(interfacesRaw.value);
-	panels.value = translate(panelsRaw.value);
-	displays.value = translate(displaysRaw.value);
-	operations.value = translate(operationsRaw.value);
+	try {
+		await translationsStore.loadTranslations(lang);
 
-	collectionsStore.translateCollections();
-	fieldsStore.translateFields();
-	mergeTranslationStringsForLanguage(lang);
+		collectionsStore.translateCollections();
+		fieldsStore.translateFields();
 
-	await loadDateFNSLocale(lang);
+		await loadDateFNSLocale(lang);
+	} catch {
+		// eslint-disable-next-line no-console
+		console.error('Failed loading translations');
+	}
 
 	return true;
 }

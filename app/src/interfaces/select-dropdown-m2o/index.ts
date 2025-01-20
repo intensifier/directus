@@ -1,6 +1,6 @@
-import { defineInterface } from '@directus/shared/utils';
-import InterfaceSelectDropdownM2O from './select-dropdown-m2o.vue';
+import { defineInterface } from '@directus/extensions';
 import PreviewSVG from './preview.svg?raw';
+import InterfaceSelectDropdownM2O from './select-dropdown-m2o.vue';
 
 export default defineInterface({
 	id: 'select-dropdown-m2o',
@@ -27,6 +27,34 @@ export default defineInterface({
 				},
 			},
 			{
+				field: 'enableCreate',
+				name: '$t:creating_items',
+				schema: {
+					default_value: true,
+				},
+				meta: {
+					interface: 'boolean',
+					options: {
+						label: '$t:enable_create_button',
+					},
+					width: 'half',
+				},
+			},
+			{
+				field: 'enableSelect',
+				name: '$t:selecting_items',
+				schema: {
+					default_value: true,
+				},
+				meta: {
+					interface: 'boolean',
+					options: {
+						label: '$t:enable_select_button',
+					},
+					width: 'half',
+				},
+			},
+			{
 				field: 'filter',
 				name: '$t:filter',
 				type: 'json',
@@ -35,6 +63,20 @@ export default defineInterface({
 					options: {
 						collectionName: collection,
 					},
+				},
+			},
+			{
+				field: 'enableLink',
+				name: '$t:item_link',
+				schema: {
+					default_value: false,
+				},
+				meta: {
+					interface: 'boolean',
+					options: {
+						label: '$t:show_link_to_item',
+					},
+					width: 'half',
 				},
 			},
 		];

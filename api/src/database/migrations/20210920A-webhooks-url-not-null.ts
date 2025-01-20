@@ -1,5 +1,5 @@
-import { Knex } from 'knex';
-import { getHelpers } from '../helpers';
+import type { Knex } from 'knex';
+import { getHelpers } from '../helpers/index.js';
 
 export async function up(knex: Knex): Promise<void> {
 	const helper = getHelpers(knex).schema;
@@ -10,7 +10,7 @@ export async function up(knex: Knex): Promise<void> {
 		return;
 	}
 
-	await helper.changeToText('directus_webhooks', 'url', {
+	await helper.changeToType('directus_webhooks', 'url', 'string', {
 		nullable: false,
 	});
 }
@@ -24,5 +24,5 @@ export async function down(knex: Knex): Promise<void> {
 		return;
 	}
 
-	await helper.changeToText('directus_webhooks', 'url');
+	await helper.changeToType('directus_webhooks', 'url', 'string');
 }

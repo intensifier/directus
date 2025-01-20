@@ -1,14 +1,16 @@
-import { useUserStore } from '@/stores';
-import { Accountability, Role, User } from '@directus/shared/types';
-import { parsePreset as parsePresetShared } from '@directus/shared/utils';
+import { useUserStore } from '@/stores/user';
+import { Accountability, Role, User } from '@directus/types';
+import { parsePreset as parsePresetShared } from '@directus/utils';
 
 export function parsePreset(preset: Record<string, any> | null): Record<string, any> {
 	const { currentUser } = useUserStore();
 
 	if (!currentUser) return preset ?? {};
+	if (!('id' in currentUser)) return preset ?? {};
 
+	// TODO make this work with new user
 	const accountability: Accountability = {
-		role: currentUser.role.id,
+		role: currentUser.role?.id ?? null,
 		user: currentUser.id,
 	};
 

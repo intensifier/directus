@@ -1,5 +1,4 @@
 type: object
-x-collection: directus_operations
 properties:
   id:
     description: Unique identifier for the operation.
@@ -25,11 +24,11 @@ properties:
     example: null
     nullable: true
   position_x:
-    descripton: Position of the operation on the X axis within the flow workspace.
+    description: Position of the operation on the X axis within the flow workspace.
     type: integer
     example: 12
   position_y:
-    descripton: Position of the operation on the Y axis within the flow workspace.
+    description: Position of the operation on the Y axis within the flow workspace.
     type: integer
     example: 12
   date_created:

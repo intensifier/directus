@@ -1,9 +1,12 @@
-import { useRelationsStore } from '@/stores/';
-import adjustFieldsForDisplays from '@/utils/adjust-fields-for-displays';
+import { useRelationsStore } from '@/stores/relations';
+import { adjustFieldsForDisplays } from '@/utils/adjust-fields-for-displays';
+import { formatItemsCountPaginated } from '@/utils/format-items-count';
+import { getItemRoute } from '@/utils/get-route';
 import { saveAsCSV } from '@/utils/save-as-csv';
 import { syncRefProperty } from '@/utils/sync-ref-property';
-import { useCollection, useItems, useSync } from '@directus/shared/composables';
-import { defineLayout, getFieldsFromTemplate } from '@directus/shared/utils';
+import { useCollection, useItems, useSync } from '@directus/composables';
+import { defineLayout } from '@directus/extensions';
+import { getFieldsFromTemplate } from '@directus/utils';
 import { clone } from 'lodash';
 import { computed, ref, toRefs } from 'vue';
 import { useI18n } from 'vue-i18n';
@@ -15,8 +18,9 @@ import { LayoutOptions, LayoutQuery } from './types';
 export default defineLayout<LayoutOptions, LayoutQuery>({
 	id: 'cards',
 	name: '$t:layouts.cards.cards',
-	icon: 'grid_4',
+	icon: 'grid_view',
 	component: CardsLayout,
+	headerShadow: false,
 	slots: {
 		options: CardsOptions,
 		sidebar: () => undefined,
@@ -24,14 +28,13 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 	},
 	setup(props, { emit }) {
 		const { t, n } = useI18n();
-
 		const relationsStore = useRelationsStore();
 
 		const selection = useSync(props, 'selection', emit);
 		const layoutOptions = useSync(props, 'layoutOptions', emit);
 		const layoutQuery = useSync(props, 'layoutQuery', emit);
 
-		const { collection, filter, search, filterUser } = toRefs(props);
+		const { collection, filter, search, filterSystem, filterUser } = toRefs(props);
 
 		const { info, primaryKeyField, fields: fieldsInCollection } = useCollection(collection);
 
@@ -54,35 +57,28 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 		const { size, icon, imageSource, title, subtitle, imageFit } = useLayoutOptions();
 		const { sort, limit, page, fields } = useLayoutQuery();
 
-		const { items, loading, error, totalPages, itemCount, totalCount, getItems } = useItems(collection, {
-			sort,
-			limit,
-			page,
-			fields,
-			filter,
-			search,
-		});
+		const { items, loading, error, totalPages, itemCount, totalCount, getItems, getTotalCount, getItemCount } =
+			useItems(collection, {
+				sort,
+				limit,
+				page,
+				fields,
+				filter,
+				search,
+				filterSystem,
+			});
 
 		const showingCount = computed(() => {
-			if ((itemCount.value || 0) < (totalCount.value || 0) && filterUser.value) {
-				if (itemCount.value === 1) {
-					return t('one_filtered_item');
-				}
-				return t('start_end_of_count_filtered_items', {
-					start: n((+page.value - 1) * limit.value + 1),
-					end: n(Math.min(page.value * limit.value, itemCount.value || 0)),
-					count: n(itemCount.value || 0),
-				});
-			}
+			// Don't show count if there are no items
+			if (!totalCount.value || !itemCount.value) return;
 
-			if (itemCount.value === 1) {
-				return t('one_item');
-			}
-
-			return t('start_end_of_count_items', {
-				start: n((+page.value - 1) * limit.value + 1),
-				end: n(Math.min(page.value * limit.value, itemCount.value || 0)),
-				count: n(itemCount.value || 0),
+			return formatItemsCountPaginated({
+				currentItems: itemCount.value,
+				currentPage: page.value,
+				perPage: limit.value,
+				isFiltered: !!filterUser.value,
+				totalItems: totalCount.value,
+				i18n: { t, n },
 			});
 		});
 
@@ -121,7 +117,7 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 			refresh,
 			selectAll,
 			resetPresetAndRefresh,
-			filter,
+			filterUser,
 			search,
 			download,
 		};
@@ -133,6 +129,8 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 
 		function refresh() {
 			getItems();
+			getTotalCount();
+			getItemCount();
 		}
 
 		function download() {
@@ -157,7 +155,7 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 			function createViewOption<T>(key: keyof LayoutOptions, defaultValue: any) {
 				return computed<T>({
 					get() {
-						return layoutOptions.value?.[key] !== undefined ? layoutOptions.value?.[key] : defaultValue;
+						return layoutOptions.value?.[key] !== undefined ? layoutOptions.value[key] : defaultValue;
 					},
 					set(newValue: T) {
 						layoutOptions.value = {
@@ -210,7 +208,8 @@ export default defineLayout<LayoutOptions, LayoutQuery>({
 
 		function getLinkForItem(item: Record<string, any>) {
 			if (!primaryKeyField.value) return;
-			return `/content/${props.collection}/${encodeURIComponent(item[primaryKeyField.value.field])}`;
+
+			return getItemRoute(props.collection, item[primaryKeyField.value.field]);
 		}
 
 		function selectAll() {
