@@ -1,5 +1,6 @@
-import { FnHelper } from '../types';
-import { Knex } from 'knex';
+import type { Knex } from 'knex';
+import type { FnHelperOptions } from '../types.js';
+import { FnHelper } from '../types.js';
 
 export class FnHelperMySQL extends FnHelper {
 	year(table: string, column: string): Knex.Raw {
@@ -34,15 +35,16 @@ export class FnHelperMySQL extends FnHelper {
 		return this.knex.raw('SECOND(??.??)', [table, column]);
 	}
 
-	count(table: string, column: string): Knex.Raw {
-		const type = this.schema.collections?.[table]?.fields?.[column]?.type ?? 'unknown';
+	count(table: string, column: string, options?: FnHelperOptions): Knex.Raw {
+		const collectionName = options?.originalCollectionName || table;
+		const type = this.schema.collections?.[collectionName]?.fields?.[column]?.type ?? 'unknown';
 
 		if (type === 'json') {
 			return this.knex.raw('JSON_LENGTH(??.??)', [table, column]);
 		}
 
 		if (type === 'alias') {
-			return this._relationalCount(table, column);
+			return this._relationalCount(table, column, options);
 		}
 
 		throw new Error(`Couldn't extract type from ${table}.${column}`);

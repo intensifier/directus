@@ -1,15 +1,19 @@
-import getDatabase from '../database';
-import { getSchema } from './get-schema';
-import { CollectionsService, FieldsService, RelationsService } from '../services';
-import { version } from '../../package.json';
-import { Snapshot, SnapshotField, SnapshotRelation } from '../types';
-import { Knex } from 'knex';
-import { omit, sortBy, toPairs, fromPairs, mapValues, isPlainObject, isArray } from 'lodash';
-import { SchemaOverview } from '@directus/shared/types';
+import type { SchemaOverview } from '@directus/types';
+import { version } from 'directus/version';
+import type { Knex } from 'knex';
+import { fromPairs, isArray, isPlainObject, mapValues, omit, sortBy, toPairs } from 'lodash-es';
+import getDatabase, { getDatabaseClient } from '../database/index.js';
+import { CollectionsService } from '../services/collections.js';
+import { FieldsService } from '../services/fields.js';
+import { RelationsService } from '../services/relations.js';
+import type { Collection, Snapshot, SnapshotField, SnapshotRelation } from '../types/index.js';
+import { getSchema } from './get-schema.js';
+import { sanitizeCollection, sanitizeField, sanitizeRelation } from './sanitize-schema.js';
 
 export async function getSnapshot(options?: { database?: Knex; schema?: SchemaOverview }): Promise<Snapshot> {
 	const database = options?.database ?? getDatabase();
-	const schema = options?.schema ?? (await getSchema({ database }));
+	const vendor = getDatabaseClient(database);
+	const schema = options?.schema ?? (await getSchema({ database, bypassCache: true }));
 
 	const collectionsService = new CollectionsService({ knex: database, schema });
 	const fieldsService = new FieldsService({ knex: database, schema });
@@ -22,19 +26,26 @@ export async function getSnapshot(options?: { database?: Knex; schema?: SchemaOv
 	]);
 
 	const collectionsFiltered = collectionsRaw.filter((item: any) => excludeSystem(item));
-	const fieldsFiltered = fieldsRaw.filter((item: any) => excludeSystem(item)).map(omitID) as SnapshotField[];
-	const relationsFiltered = relationsRaw.filter((item: any) => excludeSystem(item)).map(omitID) as SnapshotRelation[];
+	const fieldsFiltered = fieldsRaw.filter((item: any) => excludeSystem(item));
+	const relationsFiltered = relationsRaw.filter((item: any) => excludeSystem(item));
 
 	const collectionsSorted = sortBy(mapValues(collectionsFiltered, sortDeep), ['collection']);
-	const fieldsSorted = sortBy(mapValues(fieldsFiltered, sortDeep), ['collection', 'field']);
-	const relationsSorted = sortBy(mapValues(relationsFiltered, sortDeep), ['collection', 'field']);
+
+	const fieldsSorted = sortBy(mapValues(fieldsFiltered, sortDeep), ['collection', 'meta.id']).map(
+		omitID,
+	) as SnapshotField[];
+
+	const relationsSorted = sortBy(mapValues(relationsFiltered, sortDeep), ['collection', 'meta.id']).map(
+		omitID,
+	) as SnapshotRelation[];
 
 	return {
 		version: 1,
 		directus: version,
-		collections: collectionsSorted,
-		fields: fieldsSorted,
-		relations: relationsSorted,
+		vendor,
+		collections: collectionsSorted.map((collection) => sanitizeCollection(collection)) as Collection[],
+		fields: fieldsSorted.map((field) => sanitizeField(field)) as SnapshotField[],
+		relations: relationsSorted.map((relation) => sanitizeRelation(relation)) as SnapshotRelation[],
 	};
 }
 
@@ -56,7 +67,7 @@ function sortDeep(raw: any): any {
 	}
 
 	if (isArray(raw)) {
-		return sortBy(raw);
+		return raw.map((raw) => sortDeep(raw));
 	}
 
 	return raw;

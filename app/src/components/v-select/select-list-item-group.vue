@@ -1,5 +1,49 @@
+<script setup lang="ts">
+import { computed } from 'vue';
+import { Option } from './types';
+import SelectListItem from './select-list-item.vue';
+
+const props = withDefaults(
+	defineProps<{
+		item: Option;
+		itemLabelFontFamily?: string;
+		modelValue?: string | number | (string | number)[] | null;
+		multiple?: boolean;
+		allowOther?: boolean;
+		groupSelectable?: boolean;
+	}>(),
+	{
+		modelValue: null,
+		multiple: true,
+		allowOther: true,
+		groupSelectable: false,
+	},
+);
+
+const emit = defineEmits(['update:modelValue']);
+
+const isActive = computed(() => {
+	if (props.multiple) {
+		if (!Array.isArray(props.modelValue) || !props.item.value) {
+			return false;
+		}
+
+		return props.modelValue.includes(props.item.value);
+	} else {
+		return props.modelValue === props.item.value;
+	}
+});
+
+function onGroupClick(item: Option) {
+	if (!props.groupSelectable) return;
+
+	emit('update:modelValue', item.value);
+}
+</script>
+
 <template>
 	<v-list-group
+		v-show="!item.hidden"
 		:active="isActive"
 		:clickable="groupSelectable || item.selectable"
 		:value="item.value"
@@ -26,6 +70,7 @@
 			<select-list-item-group
 				v-if="childItem.children"
 				:item="childItem"
+				:item-label-font-family="itemLabelFontFamily"
 				:model-value="modelValue"
 				:multiple="multiple"
 				:allow-other="allowOther"
@@ -36,6 +81,7 @@
 				v-else
 				:model-value="modelValue"
 				:item="childItem"
+				:item-label-font-family="itemLabelFontFamily"
 				:multiple="multiple"
 				:allow-other="allowOther"
 				@update:model-value="$emit('update:modelValue', $event)"
@@ -43,57 +89,3 @@
 		</template>
 	</v-list-group>
 </template>
-
-<script lang="ts">
-import { computed, defineComponent, PropType } from 'vue';
-import { Option } from './types';
-import SelectListItem from './select-list-item.vue';
-
-export default defineComponent({
-	name: 'SelectListItemGroup',
-	components: { SelectListItem },
-	props: {
-		item: {
-			type: Object as PropType<Option>,
-			required: true,
-		},
-		modelValue: {
-			type: [String, Number, Array] as PropType<string | number | (string | number)[]>,
-			default: null,
-		},
-		multiple: {
-			type: Boolean,
-			required: true,
-		},
-		allowOther: {
-			type: Boolean,
-			required: true,
-		},
-		groupSelectable: {
-			type: Boolean,
-			default: false,
-		},
-	},
-	emits: ['update:modelValue'],
-	setup(props, { emit }) {
-		const isActive = computed(() => {
-			if (props.multiple) {
-				if (!Array.isArray(props.modelValue) || !props.item.value) {
-					return false;
-				}
-				return props.modelValue.includes(props.item.value);
-			} else {
-				return props.modelValue === props.item.value;
-			}
-		});
-
-		return { isActive, onGroupClick };
-
-		function onGroupClick(item: Option) {
-			if (!props.groupSelectable) return;
-
-			emit('update:modelValue', item.value);
-		}
-	},
-});
-</script>

@@ -1,12 +1,11 @@
-import { defineDisplay } from '@directus/shared/utils';
+import { defineDisplay } from '@directus/extensions';
 import DisplayLabels from './labels.vue';
-import { translate } from '@/utils/translate-object-values';
 
 export default defineDisplay({
 	id: 'labels',
 	name: '$t:displays.labels.labels',
 	description: '$t:displays.labels.description',
-	types: ['string', 'json', 'csv'],
+	types: ['string', 'json', 'csv', 'integer', 'float', 'decimal', 'bigInteger'],
 	icon: 'flag',
 	component: DisplayLabels,
 	handler: (value, options, { interfaceOptions }) => {
@@ -16,17 +15,12 @@ export default defineDisplay({
 			return getConfiguredChoice(value);
 		}
 
-		function getConfiguredChoice(val: string) {
+		function getConfiguredChoice(val: string | number) {
 			const configuredChoice =
-				options?.choices?.find((choice: { value: string }) => choice.value === val) ??
-				interfaceOptions?.choices?.find((choice: { value: string }) => choice.value === val);
+				options?.choices?.find((choice: { value: string | number }) => choice.value === val) ??
+				interfaceOptions?.choices?.find((choice: { value: string | number }) => choice.value === val);
 
-			if (configuredChoice) {
-				const { text } = translate(configuredChoice);
-				return text ? text : val;
-			}
-
-			return val;
+			return configuredChoice?.text ? configuredChoice.text : val;
 		}
 	},
 	options: [
@@ -73,6 +67,7 @@ export default defineDisplay({
 							meta: {
 								interface: 'system-input-translated-string',
 								width: 'half',
+								required: true,
 								options: {
 									placeholder: '$t:displays.labels.choices_text_placeholder',
 								},
@@ -88,6 +83,25 @@ export default defineDisplay({
 									font: 'monospace',
 									placeholder: '$t:displays.labels.choices_value_placeholder',
 								},
+								required: true,
+								width: 'half',
+							},
+						},
+						{
+							field: 'icon',
+							name: '$t:icon',
+							type: 'string',
+							meta: {
+								interface: 'select-icon',
+								width: 'half',
+							},
+						},
+						{
+							field: 'color',
+							name: '$t:color',
+							type: 'string',
+							meta: {
+								interface: 'select-color',
 								width: 'half',
 							},
 						},

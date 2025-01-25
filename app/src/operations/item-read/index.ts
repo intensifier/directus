@@ -1,5 +1,5 @@
-import { defineOperationApp } from '@directus/shared/utils';
-import { toArray } from '@directus/shared/utils';
+import { defineOperationApp } from '@directus/extensions';
+import { toArray } from '@directus/utils';
 
 export default defineOperationApp({
 	id: 'item-read',
@@ -89,7 +89,7 @@ export default defineOperationApp({
 							},
 						},
 						null,
-						2
+						2,
 					),
 					template: JSON.stringify(
 						{
@@ -100,7 +100,7 @@ export default defineOperationApp({
 							},
 						},
 						null,
-						2
+						2,
 					),
 				},
 			},

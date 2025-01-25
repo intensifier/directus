@@ -1,3 +1,12 @@
+<script setup lang="ts">
+interface Props {
+	/** The extension type of the file */
+	ext: string;
+}
+
+defineProps<Props>();
+</script>
+
 <template>
 	<div class="icon" :class="{ right: ext.length >= 4 }">
 		<v-icon name="insert_drive_file" />
@@ -5,24 +14,20 @@
 	</div>
 </template>
 
-<script lang="ts" setup>
-interface Props {
-	ext: string;
-}
-
-defineProps<Props>();
-</script>
-
 <style lang="scss" scoped>
-:global(body) {
-	--v-icon-file-color: var(--primary);
-	--v-icon-file-background-color: var(--background-normal);
-}
+/*
+
+	Available Variables:
+
+		--v-icon-file-color             [var(--theme--primary)]
+		--v-icon-file-background-color  [var(--theme--background-normal)]
+
+*/
 
 .icon {
 	--v-icon-size: 64px;
-	--v-icon-color: var(--v-icon-file-color);
-	color: var(--v-icon-file-color);
+	--v-icon-color: var(--v-icon-file-color, var(--theme--primary));
+	color: var(--v-icon-file-color, var(--theme--primary));
 	position: relative;
 
 	.label {
@@ -40,7 +45,7 @@ defineProps<Props>();
 
 	&.right {
 		.label {
-			background-color: var(--v-icon-file-background-color);
+			background-color: var(--v-icon-file-background-color, var(--theme--background-normal));
 			left: calc(100% - 12px - 3ch);
 			text-align: left;
 			transform: none;

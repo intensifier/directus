@@ -1,108 +1,21 @@
-<template>
-	<draggable
-		v-bind="dragOptions"
-		class="drag-area"
-		:class="{ root, drag }"
-		tag="ul"
-		:model-value="filteredDisplayItems"
-		:group="{ name: 'g1' }"
-		item-key="id"
-		draggable=".draggable"
-		:set-data="hideDragImage"
-		:disabled="disabled"
-		:force-fallback="true"
-		@start="drag = true"
-		@end="drag = false"
-		@change="change($event as ChangeEvent)"
-	>
-		<template #item="{ element, index }">
-			<li class="row" :class="{ draggable: element.$type !== 'deleted' }">
-				<item-preview
-					:item="element"
-					:template="template"
-					:collection="collection"
-					:disabled="disabled"
-					:relation-info="relationInfo"
-					:open="open[element[relationInfo.relatedPrimaryKeyField.field]] ?? false"
-					:deleted="element.$type === 'deleted'"
-					:delete-icon="getDeselectIcon(element)"
-					@update:open="open[element[relationInfo.relatedPrimaryKeyField.field]] = $event"
-					@input="update"
-					@deselect="remove(element)"
-				/>
-				<nested-draggable
-					v-if="open[element[relationInfo.relatedPrimaryKeyField.field]]"
-					:model-value="element[field]"
-					:template="template"
-					:collection="collection"
-					:disabled="disabled"
-					:field="field"
-					:fields="fields"
-					:enable-create="enableCreate"
-					:enable-select="enableSelect"
-					:custom-filter="customFilter"
-					:relation-info="relationInfo"
-					:primary-key="element[relationInfo.relatedPrimaryKeyField.field]"
-					:items-moved="itemsMoved"
-					@update:model-value="updateModelValue($event, index)"
-				/>
-			</li>
-		</template>
-	</draggable>
-
-	<template v-if="root">
-		<div v-if="!disabled" class="actions">
-			<v-button v-if="enableCreate" @click="addNewActive = true">{{ t('create_new') }}</v-button>
-			<v-button v-if="enableSelect" @click="selectDrawer = true">{{ t('add_existing') }}</v-button>
-		</div>
-
-		<drawer-item
-			v-if="!disabled"
-			:active="addNewActive"
-			:collection="collection"
-			:primary-key="'+'"
-			:edits="{}"
-			:circular-field="relationInfo.reverseJunctionField.field"
-			@input="addNew"
-			@update:active="addNewActive = false"
-		/>
-
-		<drawer-collection
-			v-if="!disabled"
-			v-model:active="selectDrawer"
-			:collection="collection"
-			:selection="[]"
-			:filter="customFilter"
-			multiple
-			@input="select"
-		/>
-	</template>
-</template>
-
-<script lang="ts">
-export default {
-	name: 'NestedDraggable',
-};
-</script>
-
 <script setup lang="ts">
-import Draggable from 'vuedraggable';
-import { computed, ref, toRefs } from 'vue';
-import hideDragImage from '@/utils/hide-drag-image';
-import ItemPreview from './item-preview.vue';
-import { Filter } from '@directus/shared/types';
 import {
+	ChangesItem,
 	DisplayItem,
-	RelationO2M,
 	RelationQueryMultiple,
 	useRelationMultiple,
-	ChangesItem,
-} from '@/composables/use-relation';
-import DrawerCollection from '@/views/private/components/drawer-collection';
-import DrawerItem from '@/views/private/components/drawer-item';
-import { useI18n } from 'vue-i18n';
-import { moveInArray } from '@directus/shared/utils';
+} from '@/composables/use-relation-multiple';
+import { RelationO2M } from '@/composables/use-relation-o2m';
+import { hideDragImage } from '@/utils/hide-drag-image';
+import DrawerCollection from '@/views/private/components/drawer-collection.vue';
+import DrawerItem from '@/views/private/components/drawer-item.vue';
+import { Filter } from '@directus/types';
+import { moveInArray } from '@directus/utils';
 import { cloneDeep } from 'lodash';
+import { computed, ref, toRefs } from 'vue';
+import { useI18n } from 'vue-i18n';
+import Draggable from 'vuedraggable';
+import ItemPreview from './item-preview.vue';
 
 type ChangeEvent =
 	| {
@@ -144,23 +57,18 @@ const props = withDefaults(
 	}>(),
 	{
 		disabled: false,
-		filter: () => null,
+		filter: null,
 		root: false,
 		modelValue: undefined,
-	}
+	},
 );
 
 const { t } = useI18n();
 const emit = defineEmits(['update:modelValue']);
 
-const value = computed<ChangesItem>({
+const value = computed<ChangesItem | any[]>({
 	get() {
-		if (props.modelValue === undefined)
-			return {
-				create: [],
-				update: [],
-				delete: [],
-			};
+		if (props.modelValue === undefined) return [];
 		return props.modelValue as ChangesItem;
 	},
 	set: (val) => {
@@ -182,17 +90,19 @@ const query = computed<RelationQueryMultiple>(() => ({
 	page: page.value,
 }));
 
-const { displayItems, create, update, remove, select, cleanItem, localDelete } = useRelationMultiple(
-	value,
-	query,
-	relationInfo,
-	primaryKey
-);
+const { displayItems, loading, create, update, remove, select, cleanItem, isLocalItem, getItemEdits } =
+	useRelationMultiple(value, query, relationInfo, primaryKey);
 
 function getDeselectIcon(item: DisplayItem) {
 	if (item.$type === 'deleted') return 'settings_backup_restore';
-	if (localDelete(item)) return 'delete';
-	return 'close';
+	if (isLocalItem(item)) return 'close';
+	return 'delete';
+}
+
+function getDeselectTooltip(item: DisplayItem) {
+	if (item.$type === 'deleted') return 'undo_removed_item';
+	if (isLocalItem(item)) return 'deselect';
+	return 'remove_item';
 }
 
 const selectDrawer = ref(false);
@@ -202,12 +112,13 @@ const dragOptions = {
 	group: 'description',
 	disabled: false,
 	ghostClass: 'ghost',
+	forceFallback: true,
 };
 
 const filteredDisplayItems = computed(() => {
 	return displayItems.value.filter(
 		(item) =>
-			!(props.itemsMoved.includes(item[relationInfo.value.relatedPrimaryKeyField.field]) && item.$type === undefined)
+			!(props.itemsMoved.includes(item[relationInfo.value.relatedPrimaryKeyField.field]) && item.$type === undefined),
 	);
 });
 
@@ -227,16 +138,20 @@ function change(event: ChangeEvent) {
 			case 'created':
 				create(cleanItem(event.added.element));
 				break;
+
 			case 'updated': {
 				const pkField = relationInfo.value.relatedPrimaryKeyField.field;
 				const exists = displayItems.value.find((item) => item[pkField] === event.added.element[pkField]);
+
 				// We have to make sure we remove the reverseJunctionField when we move it back to its initial position as otherwise it will be selected.
 				update({
 					...cleanItem(event.added.element),
 					[relationInfo.value.reverseJunctionField.field]: exists ? undefined : primaryKey.value,
 				});
+
 				break;
 			}
+
 			default:
 				update({
 					...event.added.element,
@@ -271,9 +186,105 @@ function addNew(item: Record<string, any>) {
 	item[relationInfo.value.reverseJunctionField.field] = primaryKey.value;
 	create(item);
 }
+
+function stageEdits(item: Record<string, any>) {
+	update(item);
+}
 </script>
 
+<template>
+	<v-skeleton-loader v-if="loading" type="block-list-item" />
+
+	<template v-else-if="root && filteredDisplayItems.length === 0">
+		<v-notice>
+			{{ t('no_items') }}
+		</v-notice>
+	</template>
+
+	<draggable
+		v-bind="dragOptions"
+		class="drag-area"
+		:class="{ root, drag }"
+		tag="v-list"
+		:model-value="filteredDisplayItems"
+		:group="{ name: 'g1' }"
+		item-key="id"
+		draggable=".draggable"
+		:set-data="hideDragImage"
+		:disabled="disabled"
+		@start="drag = true"
+		@end="drag = false"
+		@change="change($event as ChangeEvent)"
+	>
+		<template #item="{ element, index }">
+			<v-list-item class="row" :class="{ draggable: element.$type !== 'deleted' }">
+				<item-preview
+					:item="element"
+					:edits="getItemEdits(element)"
+					:template="template"
+					:collection="collection"
+					:disabled="disabled"
+					:relation-info="relationInfo"
+					:open="open[element[relationInfo.relatedPrimaryKeyField.field]] ?? false"
+					:deleted="element.$type === 'deleted'"
+					:delete-icon="getDeselectIcon(element)"
+					:delete-tooltip="t(getDeselectTooltip(element))"
+					@update:open="open[element[relationInfo.relatedPrimaryKeyField.field]] = $event"
+					@input="stageEdits"
+					@deselect="remove(element)"
+				/>
+				<nested-draggable
+					v-if="open[element[relationInfo.relatedPrimaryKeyField.field]]"
+					:model-value="element[field]"
+					:template="template"
+					:collection="collection"
+					:disabled="disabled"
+					:field="field"
+					:fields="fields"
+					:enable-create="enableCreate"
+					:enable-select="enableSelect"
+					:custom-filter="customFilter"
+					:relation-info="relationInfo"
+					:primary-key="element[relationInfo.relatedPrimaryKeyField.field]"
+					:items-moved="itemsMoved"
+					@update:model-value="updateModelValue($event, index)"
+				/>
+			</v-list-item>
+		</template>
+	</draggable>
+
+	<template v-if="root">
+		<div class="actions">
+			<v-button v-if="enableCreate" :disabled @click="addNewActive = true">{{ t('create_new') }}</v-button>
+			<v-button v-if="enableSelect" :disabled @click="selectDrawer = true">{{ t('add_existing') }}</v-button>
+		</div>
+
+		<drawer-item
+			v-if="!disabled"
+			:active="addNewActive"
+			:collection="collection"
+			:primary-key="'+'"
+			:edits="{}"
+			:circular-field="relationInfo.reverseJunctionField.field"
+			@input="addNew"
+			@update:active="addNewActive = false"
+		/>
+
+		<drawer-collection
+			v-if="!disabled"
+			v-model:active="selectDrawer"
+			:collection="collection"
+			:selection="[]"
+			:filter="customFilter"
+			multiple
+			@input="select"
+		/>
+	</template>
+</template>
+
 <style lang="scss" scoped>
+@use '@/styles/mixins';
+
 .drag-area {
 	min-height: 12px;
 
@@ -281,24 +292,48 @@ function addNew(item: Record<string, any>) {
 		margin-left: 0;
 		padding: 0;
 
+		.v-skeleton-loader {
+			margin: 12px 0px 12px auto;
+			width: calc(100% - 24px);
+		}
+
 		&:empty {
 			min-height: 0;
 		}
+	}
+
+	&.v-list {
+		@include mixins.list-interface;
+
+		overflow: hidden;
 	}
 }
 
 .row {
 	.preview {
 		padding: 12px;
-		background-color: var(--card-face-color);
-		border-radius: var(--border-radius);
-		box-shadow: 0px 0px 6px 0px rgb(var(--card-shadow-color), 0.2);
 		cursor: grab;
-		transition: var(--fast) var(--transition);
-		transition-property: box-shadow, background-color;
+		border-style: solid;
+		background-color: var(--theme--background);
+		border: var(--theme--border-width) solid var(--theme--border-color);
+		border-radius: var(--theme--border-radius);
 
 		& + .drag-area {
-			padding-top: 12px;
+			padding: 0;
+
+			> .v-list-item:first-child {
+				margin-top: 8px;
+			}
+		}
+	}
+
+	&.v-list-item {
+		display: block;
+		--v-list-item-padding: 0;
+		--v-list-item-margin: 0;
+
+		+ .v-list-item {
+			margin-top: 8px;
 		}
 	}
 
@@ -308,7 +343,10 @@ function addNew(item: Record<string, any>) {
 }
 
 .ghost .preview {
-	background-color: var(--primary-alt);
-	box-shadow: 0 !important;
+	background-color: var(--theme--primary-background);
+}
+
+.actions {
+	@include mixins.list-interface-actions;
 }
 </style>

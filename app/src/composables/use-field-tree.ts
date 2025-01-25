@@ -1,6 +1,7 @@
-import { useFieldsStore, useRelationsStore } from '@/stores/';
-import { Field, Relation, Type } from '@directus/shared/types';
-import { getRelationType } from '@directus/shared/utils';
+import { useFieldsStore } from '@/stores/fields';
+import { useRelationsStore } from '@/stores/relations';
+import { Field, Relation, Type } from '@directus/types';
+import { getRelationType } from '@directus/utils';
 import { isNil } from 'lodash';
 import { Ref, ref, watch } from 'vue';
 
@@ -14,6 +15,7 @@ export type FieldNode = {
 	type: Type;
 	children?: FieldNode[];
 	group?: boolean;
+	_loading?: boolean;
 };
 
 export type FieldTreeContext = {
@@ -24,8 +26,8 @@ export type FieldTreeContext = {
 
 export function useFieldTree(
 	collection: Ref<string | null>,
-	inject?: Ref<{ fields: Field[]; relations: Relation[] } | null>,
-	filter: (field: Field) => boolean = () => true
+	inject?: Ref<{ fields: Field[]; relations?: Relation[] } | null>,
+	filter: (field: Field, parent?: FieldNode) => boolean = () => true,
 ): FieldTreeContext {
 	const fieldsStore = useFieldsStore();
 	const relationsStore = useRelationsStore();
@@ -33,7 +35,10 @@ export function useFieldTree(
 	const treeList = ref<FieldNode[]>([]);
 	const visitedPaths = ref<Set<string>>(new Set());
 
-	watch(() => collection.value, refresh, { immediate: true });
+	// Refresh when collection or fields of the collection are updated
+	watch([collection, () => collection.value && fieldsStore.getFieldsForCollectionSorted(collection.value)], refresh, {
+		immediate: true,
+	});
 
 	return { treeList, loadFieldRelations, refresh };
 
@@ -57,9 +62,9 @@ export function useFieldTree(
 			.filter(
 				(field) =>
 					field.meta?.special?.includes('group') ||
-					(!field.meta?.special?.includes('alias') && !field.meta?.special?.includes('no-data'))
+					(!field.meta?.special?.includes('alias') && !field.meta?.special?.includes('no-data')),
 			)
-			.filter((field) => filter(field));
+			.filter((field) => filter(field, parent));
 
 		const topLevelFields = allFields.filter((field) => {
 			if (parent?.group === true) return field.meta?.group === parent?.field;
@@ -72,7 +77,7 @@ export function useFieldTree(
 	}
 
 	function makeNode(field: Field, parent?: FieldNode): FieldNode | FieldNode[] {
-		const relatedCollections = getRelatedCollections(field);
+		const { relationType, relatedCollections } = getRelationTypeAndRelatedCollections(field);
 		const pathContext = parent?.path ? parent.path + '.' : '';
 		const keyContext = parent?.key ? parent.key + '.' : '';
 
@@ -88,13 +93,25 @@ export function useFieldTree(
 				type: field.type,
 			};
 
+			const children = getTree(field.collection, node);
+
+			if (children) {
+				for (const child of children) {
+					if (child.relatedCollection) {
+						child.children = [
+							{ name: 'Loading...', field: '', collection: '', key: '', path: '', type: 'alias', _loading: true },
+						];
+					}
+				}
+			}
+
 			return {
 				...node,
-				children: getTree(field.collection, node),
+				children,
 			};
 		}
 
-		if (relatedCollections.length <= 1) {
+		if (relatedCollections.length <= 1 && relationType !== 'm2a') {
 			return {
 				name: field.name,
 				field: field.field,
@@ -119,20 +136,23 @@ export function useFieldTree(
 		});
 	}
 
-	function getRelatedCollections(field: Field): string[] {
+	function getRelationTypeAndRelatedCollections(field: Field): {
+		relationType: 'o2m' | 'm2o' | 'm2a' | null;
+		relatedCollections: string[];
+	} {
 		const relation = getRelationForField(field);
-		if (!relation?.meta) return [];
+		if (!relation?.meta) return { relationType: null, relatedCollections: [] };
 		const relationType = getRelationType({ relation, collection: field.collection, field: field.field });
 
 		switch (relationType) {
 			case 'o2m':
-				return [relation!.meta!.many_collection];
+				return { relationType: 'o2m', relatedCollections: [relation!.meta!.many_collection] };
 			case 'm2o':
-				return [relation!.meta!.one_collection!];
+				return { relationType: 'm2o', relatedCollections: [relation!.meta!.one_collection!] };
 			case 'm2a':
-				return relation!.meta!.one_allowed_collections!;
+				return { relationType: 'm2a', relatedCollections: relation!.meta!.one_allowed_collections! };
 			default:
-				return [];
+				return { relationType: null, relatedCollections: [] };
 		}
 	}
 
@@ -145,20 +165,32 @@ export function useFieldTree(
 		return relations.find(
 			(relation: Relation) =>
 				(relation.collection === field.collection && relation.field === field.field) ||
-				(relation.related_collection === field.collection && relation.meta?.one_field === field.field)
+				(relation.related_collection === field.collection && relation.meta?.one_field === field.field),
 		);
 	}
 
 	function getNodeAtPath([field, ...path]: string[], root?: FieldNode[]): FieldNode | undefined {
-		for (const node of root || []) {
-			if (node.field === field) {
-				if (path.length) {
-					return getNodeAtPath(path, node.children);
-				} else {
-					return node;
-				}
-			}
-		}
+		if (!root?.length) return undefined;
+
+		const node = findFieldNodeInTree(field, root);
+
+		if (node && path.length) return getNodeAtPath(path, node.children);
+
+		return node;
+	}
+
+	function findFieldNodeInTree(field: string | undefined, root: FieldNode[]): FieldNode | undefined {
+		const node = root.find((node) => node.field === field);
+		if (node) return node;
+
+		const childrenNodes = root.flatMap((node) => {
+			if (node.group && node.children?.length) return node.children;
+			return [];
+		});
+
+		if (!childrenNodes?.length) return undefined;
+
+		return findFieldNodeInTree(field, childrenNodes);
 	}
 
 	function loadFieldRelations(path: string) {
@@ -166,6 +198,10 @@ export function useFieldTree(
 			visitedPaths.value.add(path);
 
 			const node = getNodeAtPath(path.split('.'), treeList.value);
+
+			if (node && node.children?.length === 1 && (node.children as [FieldNode])[0]._loading) {
+				node.children = getTree(node.relatedCollection, node);
+			}
 
 			for (const child of node?.children || []) {
 				if (child?.relatedCollection) {

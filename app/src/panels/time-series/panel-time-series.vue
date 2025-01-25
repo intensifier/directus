@@ -1,36 +1,38 @@
-<template>
-	<div class="time-series">
-		<div ref="chartEl" />
-	</div>
-</template>
-
 <script setup lang="ts">
-import { useFieldsStore } from '@/stores';
-import { adjustDate } from '@/utils/adjust-date';
-import { Filter } from '@directus/shared/types';
-import { abbreviateNumber } from '@directus/shared/utils';
-import { cssVar } from '@directus/shared/utils/browser';
+import { useFieldsStore } from '@/stores/fields';
+import { PanelFunction } from '@/types/panels';
+import type { Filter } from '@directus/types';
+import { abbreviateNumber, adjustDate } from '@directus/utils';
 import ApexCharts from 'apexcharts';
 import { addWeeks } from 'date-fns';
-import { isNil } from 'lodash';
+import { isNil, orderBy, snakeCase } from 'lodash';
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { orderBy } from 'lodash';
 
 const props = withDefaults(
 	defineProps<{
 		height: number;
 		showHeader?: boolean;
-		data?: object[];
+		data?: {
+			group: Record<string, number | string>;
+			count: Record<string, number>;
+			countDistinct: Record<string, number>;
+			avg: Record<string, number>;
+			avgDistinct: Record<string, number>;
+			sum: Record<string, number>;
+			sumDistinct: Record<string, number>;
+			min: Record<string, number>;
+			max: Record<string, number>;
+		}[];
 		id: string;
 		now: Date;
 		collection: string;
 		dateField: string;
 		valueField: string;
-		function: string;
+		function: PanelFunction;
 		precision?: string;
 		range?: string;
-		color?: string;
+		color?: string | null;
 		fillType?: string;
 		curveType?: string;
 		decimals?: number;
@@ -44,7 +46,7 @@ const props = withDefaults(
 		showHeader: false,
 		data: () => [],
 		precision: 'hour',
-		color: cssVar('--primary'),
+		color: 'var(--theme--primary)',
 		range: '1 week',
 		fillType: 'gradient',
 		curveType: 'smooth',
@@ -54,7 +56,7 @@ const props = withDefaults(
 		filter: () => ({}),
 		showXAxis: true,
 		showYAxis: true,
-	}
+	},
 );
 
 const { d, t, n } = useI18n();
@@ -67,7 +69,7 @@ const chart = ref<ApexCharts>();
 
 const valueLabel = computed(() => {
 	const field = fieldsStore.getField(props.collection, props.valueField)!;
-	const operation = t(props.function);
+	const operation = t(snakeCase(props.function));
 	return `${field.name} (${operation})`;
 });
 
@@ -103,7 +105,7 @@ watch(
 		chart.value?.destroy();
 		setupChart();
 	},
-	{ deep: true }
+	{ deep: true },
 );
 
 onMounted(setupChart);
@@ -117,17 +119,23 @@ function setupChart() {
 
 	const isFieldTimestamp = fieldsStore.getField(props.collection, props.dateField)?.type === 'timestamp';
 
+	const allDates = props.data.map((metric) => {
+		return toIncludeTimezoneOffset(metric.group, isFieldTimestamp);
+	});
+
+	const minDate = Math.min(...allDates);
+	const maxDate = Math.max(...allDates);
+
 	metrics.value = orderBy(
 		props.data.map((metric) => ({
-			x: new Date(toISO(metric.group)).getTime() - (isFieldTimestamp ? new Date().getTimezoneOffset() * 60 * 1000 : 0),
-
+			x: toIncludeTimezoneOffset(metric.group, isFieldTimestamp),
 			y: Number(Number(metric[props.function][props.valueField]).toFixed(props.decimals ?? 0)),
 		})),
-		'x'
+		'x',
 	);
 
 	chart.value = new ApexCharts(chartEl.value, {
-		colors: [props.color ? props.color : cssVar('--primary')],
+		colors: [props.color ? props.color : 'var(--theme--primary)'],
 		chart: {
 			type: props.fillType === 'disabled' ? 'line' : 'area',
 			height: '100%',
@@ -140,8 +148,8 @@ function setupChart() {
 			zoom: {
 				enabled: false,
 			},
-			fontFamily: 'var(--family-sans-serif)',
-			foreColor: 'var(--foreground-subdued)',
+			fontFamily: 'var(--theme--fonts--sans--font-family)',
+			foreColor: 'var(--theme--foreground-subdued)',
 			animations: {
 				enabled: false,
 			},
@@ -170,12 +178,12 @@ function setupChart() {
 					[
 						{
 							offset: 0,
-							color: props.color ? props.color : cssVar('--primary'),
+							color: props.color ? props.color : 'var(--theme--primary)',
 							opacity: 0.25,
 						},
 						{
 							offset: 100,
-							color: props.color ? props.color : cssVar('--primary'),
+							color: props.color ? props.color : 'var(--theme--primary)',
 							opacity: 0,
 						},
 					],
@@ -183,7 +191,7 @@ function setupChart() {
 			},
 		},
 		grid: {
-			borderColor: 'var(--border-subdued)',
+			borderColor: 'var(--theme--border-color-subdued)',
 			padding: {
 				top: props.showHeader ? -20 : -4,
 				bottom: 0,
@@ -223,14 +231,17 @@ function setupChart() {
 			axisBorder: {
 				show: false,
 			},
-			range: props.now.getTime() - adjustDate(props.now, `-${props.range}`)!.getTime(),
-			max: props.now.getTime(),
+			range:
+				props.range === 'auto'
+					? maxDate - minDate
+					: props.now.getTime() - adjustDate(props.now, `-${props.range}`)!.getTime(),
+			max: props.range === 'auto' ? maxDate : props.now.getTime(),
 			labels: {
 				show: props.showXAxis ?? true,
 				offsetY: -4,
 				style: {
-					fontFamily: 'var(--family-sans-serif)',
-					foreColor: 'var(--foreground-subdued)',
+					fontFamily: 'var(--theme--fonts--sans--font-family)',
+					foreColor: 'var(--theme--foreground-subdued)',
 					fontWeight: 600,
 					fontSize: '10px',
 				},
@@ -238,7 +249,7 @@ function setupChart() {
 			},
 			crosshairs: {
 				stroke: {
-					color: 'var(--border-normal)',
+					color: 'var(--theme--form--field--input--border-color)',
 				},
 			},
 		},
@@ -277,8 +288,8 @@ function setupChart() {
 								  } as any);
 						},
 						style: {
-							fontFamily: 'var(--family-sans-serif)',
-							foreColor: 'var(--foreground-subdued)',
+							fontFamily: 'var(--theme--fonts--sans--font-family)',
+							foreColor: 'var(--theme--foreground-subdued)',
 							fontWeight: 600,
 							fontSize: '10px',
 						},
@@ -289,6 +300,10 @@ function setupChart() {
 	});
 
 	chart.value.render();
+
+	function toIncludeTimezoneOffset(time: Record<string, any>, isFieldTimestamp: boolean): number {
+		return new Date(toISO(time)).getTime() - (isFieldTimestamp ? new Date().getTimezoneOffset() * 60 * 1000 : 0);
+	}
 
 	function toISO(metric: Record<string, any>) {
 		const year = metric[`${props.dateField}_year`];
@@ -312,6 +327,12 @@ function setupChart() {
 }
 </script>
 
+<template>
+	<div class="time-series">
+		<div ref="chartEl" />
+	</div>
+</template>
+
 <style scoped>
 .time-series {
 	width: 100%;
@@ -321,16 +342,16 @@ function setupChart() {
 
 <style>
 .apexcharts-tooltip.apexcharts-theme-light {
-	border-color: var(--border-normal) !important;
+	border-color: var(--theme--form--field--input--border-color) !important;
 }
 
 .apexcharts-tooltip.apexcharts-theme-light .apexcharts-tooltip-title {
-	border-color: var(--border-normal) !important;
+	border-color: var(--theme--form--field--input--border-color) !important;
 	margin-bottom: 0;
 	padding: 0 4px;
 	font-weight: 600 !important;
 	font-size: 10px !important;
-	background-color: var(--background-subdued) !important;
+	background-color: var(--theme--background-subdued) !important;
 }
 
 .apexcharts-tooltip-y-group {
@@ -340,7 +361,7 @@ function setupChart() {
 }
 
 .apexcharts-tooltip-series-group {
-	background-color: var(--background-normal) !important;
+	background-color: var(--theme--background-normal) !important;
 	padding: 0;
 }
 

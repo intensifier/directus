@@ -1,81 +1,19 @@
-<template>
-	<v-notice v-if="!relationInfo" type="warning">
-		{{ t('relationship_not_setup') }}
-	</v-notice>
-	<v-notice v-else-if="!displayTemplate" type="warning">
-		{{ t('display_template_not_setup') }}
-	</v-notice>
-	<div v-else class="many-to-one">
-		<v-skeleton-loader v-if="loading" type="input" />
-		<v-input v-else clickable :placeholder="t('select_an_item')" :disabled="disabled" @click="onPreviewClick">
-			<template v-if="displayItem" #input>
-				<div class="preview">
-					<render-template
-						:collection="relationInfo.relatedCollection.collection"
-						:item="displayItem"
-						:template="displayTemplate"
-					/>
-				</div>
-			</template>
-
-			<template #append>
-				<template v-if="displayItem">
-					<v-icon v-tooltip="t('edit')" name="open_in_new" class="edit" @click.stop="editModalActive = true" />
-					<v-icon
-						v-if="!disabled"
-						v-tooltip="t('deselect')"
-						name="close"
-						class="deselect"
-						@click.stop="$emit('input', null)"
-					/>
-				</template>
-				<template v-else>
-					<v-icon
-						v-if="createAllowed"
-						v-tooltip="t('create_item')"
-						class="add"
-						name="add"
-						@click.stop="editModalActive = true"
-					/>
-					<v-icon class="expand" name="expand_more" />
-				</template>
-			</template>
-		</v-input>
-
-		<drawer-item
-			v-model:active="editModalActive"
-			:collection="relationInfo.relatedCollection.collection"
-			:primary-key="currentPrimaryKey"
-			:edits="edits"
-			:circular-field="relationInfo.relation.meta?.one_field ?? undefined"
-			:disabled="!updateAllowed || disabled"
-			@input="onDrawerItemInput"
-		/>
-
-		<drawer-collection
-			v-if="!disabled"
-			v-model:active="selectModalActive"
-			:collection="relationInfo.relatedCollection.collection"
-			:selection="selection"
-			:filter="customFilter"
-			@input="onSelection"
-		/>
-	</div>
-</template>
-
 <script setup lang="ts">
-import { RelationQuerySingle, useRelationM2O, useRelationSingle } from '@/composables/use-relation';
-import { usePermissionsStore, useCollectionsStore } from '@/stores';
-import adjustFieldsForDisplays from '@/utils/adjust-fields-for-displays';
+import { useRelationM2O } from '@/composables/use-relation-m2o';
+import { useRelationPermissionsM2O } from '@/composables/use-relation-permissions';
+import { RelationQuerySingle, useRelationSingle } from '@/composables/use-relation-single';
+import { useCollectionsStore } from '@/stores/collections';
+import { adjustFieldsForDisplays } from '@/utils/adjust-fields-for-displays';
 import { parseFilter } from '@/utils/parse-filter';
-import DrawerCollection from '@/views/private/components/drawer-collection';
-import DrawerItem from '@/views/private/components/drawer-item';
-import { Filter } from '@directus/shared/types';
-import { deepMap, getFieldsFromTemplate } from '@directus/shared/utils';
+import DrawerCollection from '@/views/private/components/drawer-collection.vue';
+import DrawerItem from '@/views/private/components/drawer-item.vue';
+import { Filter } from '@directus/types';
+import { deepMap, getFieldsFromTemplate } from '@directus/utils';
 import { get } from 'lodash';
 import { render } from 'micromustache';
 import { computed, inject, ref, toRefs } from 'vue';
 import { useI18n } from 'vue-i18n';
+import { getItemRoute } from '@/utils/get-route';
 
 const props = withDefaults(
 	defineProps<{
@@ -86,14 +24,21 @@ const props = withDefaults(
 		selectMode?: 'auto' | 'dropdown' | 'modal';
 		disabled?: boolean;
 		filter?: Filter | null;
+		enableCreate?: boolean;
+		enableSelect?: boolean;
+		loading?: boolean;
+		enableLink?: boolean;
 	}>(),
 	{
-		value: () => null,
+		value: null,
 		selectMode: 'auto',
 		disabled: false,
-		template: () => null,
-		filter: () => null,
-	}
+		template: null,
+		filter: null,
+		enableCreate: true,
+		enableSelect: true,
+		enableLink: false,
+	},
 );
 
 const emit = defineEmits(['input']);
@@ -110,13 +55,14 @@ const customFilter = computed(() => {
 			}
 
 			return val;
-		})
+		}),
 	);
 });
 
 const { t } = useI18n();
 const { collection, field } = toRefs(props);
 const { relationInfo } = useRelationM2O(collection, field);
+
 const value = computed({
 	get: () => props.value ?? null,
 	set: (value) => {
@@ -143,7 +89,7 @@ const requiredFields = computed(() => {
 
 	return adjustFieldsForDisplays(
 		getFieldsFromTemplate(displayTemplate.value),
-		relationInfo.value?.relatedCollection.collection
+		relationInfo.value?.relatedCollection.collection,
 	);
 });
 
@@ -151,7 +97,11 @@ const query = computed<RelationQuerySingle>(() => ({
 	fields: requiredFields.value,
 }));
 
-const { update, remove, displayItem, loading } = useRelationSingle(value, query, relationInfo);
+const { update, remove, displayItem, loading } = useRelationSingle(value, query, relationInfo, {
+	enabled: computed(() => !props.loading),
+});
+
+const { createAllowed } = useRelationPermissionsM2O(relationInfo);
 
 const currentPrimaryKey = computed<string | number>(() => {
 	if (!displayItem.value || !props.value || !relationInfo.value) return '+';
@@ -172,7 +122,15 @@ const edits = computed(() => {
 function onPreviewClick() {
 	if (props.disabled) return;
 
-	selectModalActive.value = true;
+	// Prevent double dialog in case the edit dialog is already open
+	if (editModalActive.value === true) return;
+
+	if (props.enableSelect) {
+		selectModalActive.value = true;
+		return;
+	}
+
+	editModalActive.value = true;
 }
 
 function onDrawerItemInput(event: any) {
@@ -188,38 +146,138 @@ const selection = computed<(number | string)[]>(() => {
 	if (typeof props.value === 'object' && pkField in props.value) {
 		return [props.value[pkField]];
 	}
+
 	return [props.value];
 });
 
-function onSelection(selection: (number | string)[]) {
-	if (selection.length === 0) {
-		remove();
-	} else {
-		update(selection[0]);
+function onSelection(selection: (number | string)[] | null) {
+	if (selection) {
+		if (selection[0]) {
+			update(selection[0]);
+		} else {
+			remove();
+		}
 	}
 
 	selectModalActive.value = false;
 }
 
-const { hasPermission } = usePermissionsStore();
-
-const createAllowed = computed(() => {
-	if (!relationInfo.value) return false;
-	return hasPermission(relationInfo.value.relatedCollection.collection, 'create');
-});
-
-const updateAllowed = computed(() => {
-	if (!relationInfo.value) return false;
-	return hasPermission(relationInfo.value.relatedCollection.collection, 'update');
-});
+function getLinkForItem() {
+	if (!collection.value || !currentPrimaryKey.value || !relationInfo.value) return '';
+	return getItemRoute(relationInfo.value.relatedCollection.collection, currentPrimaryKey.value);
+}
 </script>
 
+<template>
+	<v-notice v-if="!relationInfo" type="warning">
+		{{ t('relationship_not_setup') }}
+	</v-notice>
+	<v-notice v-else-if="relationInfo.relatedCollection.meta?.singleton" type="warning">
+		{{ t('no_singleton_relations') }}
+	</v-notice>
+	<v-notice v-else-if="!displayTemplate" type="warning">
+		{{ t('display_template_not_setup') }}
+	</v-notice>
+	<v-notice v-else-if="!enableCreate && !enableSelect && !displayItem">
+		{{ t('no_items') }}
+	</v-notice>
+
+	<div v-else class="many-to-one">
+		<v-skeleton-loader v-if="loading" type="input" />
+		<v-input
+			v-else
+			clickable
+			:placeholder="t(enableSelect ? 'select_an_item' : 'create_item')"
+			:disabled="disabled"
+			@click="onPreviewClick"
+		>
+			<template v-if="displayItem" #input>
+				<div class="preview">
+					<render-template
+						:collection="relationInfo.relatedCollection.collection"
+						:item="displayItem"
+						:template="displayTemplate"
+					/>
+				</div>
+			</template>
+
+			<template #append>
+				<div class="item-actions">
+					<template v-if="displayItem">
+						<router-link
+							v-if="enableLink"
+							v-tooltip="t('navigate_to_item')"
+							:to="getLinkForItem()"
+							class="item-link"
+							@click.stop
+						>
+							<v-icon name="launch" />
+						</router-link>
+
+						<v-icon v-if="!disabled" v-tooltip="t('edit_item')" name="edit" clickable @click="editModalActive = true" />
+
+						<v-icon
+							v-if="!disabled"
+							v-tooltip="t('deselect')"
+							name="close"
+							clickable
+							@click.stop="$emit('input', null)"
+						/>
+					</template>
+
+					<template v-else>
+						<v-icon
+							v-if="createAllowed && enableCreate"
+							v-tooltip="t('create_item')"
+							class="add"
+							name="add"
+							@click="editModalActive = true"
+						/>
+
+						<v-icon v-if="enableSelect" class="expand" name="expand_more" />
+					</template>
+				</div>
+			</template>
+		</v-input>
+
+		<drawer-item
+			v-model:active="editModalActive"
+			:collection="relationInfo.relatedCollection.collection"
+			:primary-key="currentPrimaryKey"
+			:edits="edits"
+			:circular-field="relationInfo.relation.meta?.one_field ?? undefined"
+			:disabled="disabled"
+			@input="onDrawerItemInput"
+		/>
+
+		<drawer-collection
+			v-if="!disabled"
+			v-model:active="selectModalActive"
+			:collection="relationInfo.relatedCollection.collection"
+			:selection="selection"
+			:filter="customFilter"
+			@input="onSelection"
+		/>
+	</div>
+</template>
+
 <style lang="scss" scoped>
+@use '@/styles/mixins';
+
+.item-actions {
+	@include mixins.list-interface-item-actions($item-link: true);
+
+	.add:hover {
+		--v-icon-color: var(--theme--primary);
+	}
+}
+
 .many-to-one {
 	position: relative;
 
 	:deep(.v-input .append) {
 		display: flex;
+		gap: 4px;
 	}
 }
 
@@ -233,10 +291,6 @@ const updateAllowed = computed(() => {
 	flex-grow: 1;
 	height: calc(100% - 16px);
 	overflow: hidden;
-
-	> .render-template {
-		height: 100%;
-	}
 }
 
 .expand {
@@ -245,21 +299,5 @@ const updateAllowed = computed(() => {
 	&.active {
 		transform: scaleY(-1);
 	}
-}
-
-.edit {
-	margin-right: 4px;
-
-	&:hover {
-		--v-icon-color: var(--foreground-normal);
-	}
-}
-
-.add:hover {
-	--v-icon-color: var(--primary);
-}
-
-.deselect:hover {
-	--v-icon-color: var(--danger);
 }
 </style>

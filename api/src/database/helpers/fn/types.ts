@@ -1,13 +1,26 @@
-import { SchemaOverview } from '@directus/shared/types';
-import { Knex } from 'knex';
-import { DatabaseHelper } from '../types';
+import type { Filter, Permission, Query, SchemaOverview } from '@directus/types';
+import type { Knex } from 'knex';
+import { applyFilter, generateAlias } from '../../../utils/apply-query.js';
+import type { AliasMap } from '../../../utils/get-column-path.js';
+import { DatabaseHelper } from '../types.js';
 
 export type FnHelperOptions = {
-	type?: string;
+	type: string | undefined;
+	originalCollectionName: string | undefined;
+	relationalCountOptions:
+		| {
+				query: Query;
+				cases: Filter[];
+				permissions: Permission[];
+		  }
+		| undefined;
 };
 
 export abstract class FnHelper extends DatabaseHelper {
-	constructor(protected knex: Knex, protected schema: SchemaOverview) {
+	constructor(
+		knex: Knex,
+		protected schema: SchemaOverview,
+	) {
 		super(knex);
 		this.schema = schema;
 	}
@@ -22,25 +35,48 @@ export abstract class FnHelper extends DatabaseHelper {
 	abstract second(table: string, column: string, options?: FnHelperOptions): Knex.Raw;
 	abstract count(table: string, column: string, options?: FnHelperOptions): Knex.Raw;
 
-	protected _relationalCount(table: string, column: string): Knex.Raw {
+	protected _relationalCount(table: string, column: string, options?: FnHelperOptions): Knex.Raw {
+		const collectionName = options?.originalCollectionName || table;
+
 		const relation = this.schema.relations.find(
-			(relation) => relation.related_collection === table && relation?.meta?.one_field === column
+			(relation) => relation.related_collection === collectionName && relation?.meta?.one_field === column,
 		);
 
-		const currentPrimary = this.schema.collections[table].primary;
+		const currentPrimary = this.schema.collections[collectionName]!.primary;
 
 		if (!relation) {
-			throw new Error(`Field ${table}.${column} isn't a nested relational collection`);
+			throw new Error(`Field ${collectionName}.${column} isn't a nested relational collection`);
 		}
 
-		return this.knex.raw(
-			'(' +
-				this.knex
-					.count('*')
-					.from(relation.collection)
-					.where(relation.field, '=', this.knex.raw(`??.??`, [table, currentPrimary]))
-					.toQuery() +
-				')'
-		);
+		// generate a unique alias for the relation collection, to prevent collisions in self referencing relations
+		const alias = generateAlias();
+
+		let countQuery = this.knex
+			.count('*')
+			.from({ [alias]: relation.collection })
+			.where(this.knex.raw(`??.??`, [alias, relation.field]), '=', this.knex.raw(`??.??`, [table, currentPrimary]));
+
+		if (options?.relationalCountOptions?.query.filter) {
+			// set the newly aliased collection in the alias map as the default parent collection, indicated by '', for any nested filters
+			const aliasMap: AliasMap = {
+				'': {
+					alias,
+					collection: relation.collection,
+				},
+			};
+
+			countQuery = applyFilter(
+				this.knex,
+				this.schema,
+				countQuery,
+				options.relationalCountOptions.query.filter,
+				relation.collection,
+				aliasMap,
+				options.relationalCountOptions.cases,
+				options.relationalCountOptions.permissions,
+			).query;
+		}
+
+		return this.knex.raw('(' + countQuery.toQuery() + ')');
 	}
 }

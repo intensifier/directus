@@ -1,4 +1,4 @@
-import { Type } from '@directus/shared/types';
+import { Type } from '@directus/types';
 
 export const VALIDATION_TYPES = ['FAILED_VALIDATION', 'RECORD_NOT_UNIQUE'];
 
@@ -30,6 +30,7 @@ export const DIRECTUS_LOGO = `
 export const COLLECTIONS_DENY_LIST = [
 	'directus_activity',
 	'directus_collections',
+	'directus_extensions',
 	'directus_fields',
 	'directus_migrations',
 	'directus_relations',
@@ -60,9 +61,12 @@ export const MODULE_BAR_DEFAULT = [
 		enabled: true,
 	},
 	{
-		type: 'module',
+		type: 'link',
 		id: 'docs',
 		enabled: true,
+		name: '$t:documentation',
+		icon: 'help',
+		url: 'https://docs.directus.io',
 	},
 	{
 		type: 'module',
@@ -105,7 +109,7 @@ export const FIELD_TYPES_SELECT: Array<{ value: Type; text: string } | { divider
 	},
 	{ divider: true },
 	{
-		text: '$t:geometry',
+		text: '$t:geometry.All',
 		value: 'geometry',
 	},
 	{ divider: true },
@@ -144,6 +148,13 @@ export const FIELD_TYPES_SELECT: Array<{ value: Type; text: string } | { divider
 	},
 ];
 
-export const DEFAULT_AUTH_PROVIDER = 'default';
+export const DEFAULT_AUTH_PROVIDER = 'local';
+export const DEFAULT_AUTH_DRIVER = 'default';
 
-export const AUTH_SSO_DRIVERS = ['oauth2', 'openid'];
+export const AUTH_SSO_DRIVERS = ['oauth2', 'openid', 'saml'];
+
+export const DEFAULT_REPORT_BUG_URL = 'https://github.com/directus/directus/issues/new?template=bug_report.yml';
+export const DEFAULT_REPORT_FEATURE_URL =
+	'https://github.com/directus/directus/discussions/new?category=feature-requests';
+
+export const SDK_AUTH_REFRESH_BEFORE_EXPIRES = 10_000;

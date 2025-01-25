@@ -1,5 +1,5 @@
-import { SchemaOverview } from '@directus/shared/types';
-import { Knex } from 'knex';
+import type { SchemaOverview } from '@directus/types';
+import type { Knex } from 'knex';
 
 export interface AuthDriverOptions {
 	knex: Knex;
@@ -32,20 +32,14 @@ export interface Session {
 export type DirectusTokenPayload = {
 	id?: string;
 	role: string | null;
+	session?: string;
 	app_access: boolean | number;
 	admin_access: boolean | number;
 	share?: string;
-	share_scope?: {
-		collection: string;
-		item: string;
-	};
 };
 
 export type ShareData = {
 	share_id: string;
-	share_role: string;
-	share_item: string;
-	share_collection: string;
 	share_start: Date;
 	share_end: Date;
 	share_times_used: number;
@@ -54,8 +48,10 @@ export type ShareData = {
 };
 
 export type LoginResult = {
-	accessToken: any;
-	refreshToken: any;
-	expires: any;
-	id?: any;
+	accessToken: string;
+	refreshToken: string;
+	expires: number;
+	id?: string;
 };
+
+export type AuthenticationMode = 'json' | 'cookie' | 'session';

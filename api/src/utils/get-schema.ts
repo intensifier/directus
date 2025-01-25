@@ -1,64 +1,122 @@
-import SchemaInspector from '@directus/schema';
-import { Accountability, Filter, SchemaOverview } from '@directus/shared/types';
-import { parseJSON, toArray } from '@directus/shared/utils';
-import { Knex } from 'knex';
-import { mapValues } from 'lodash';
-import { getCache, setSystemCache } from '../cache';
-import { ALIAS_TYPES } from '../constants';
-import getDatabase from '../database';
-import { systemCollectionRows } from '../database/system-data/collections';
-import { systemFieldRows } from '../database/system-data/fields';
-import env from '../env';
-import logger from '../logger';
-import { RelationsService } from '../services';
-import getDefaultValue from './get-default-value';
-import getLocalType from './get-local-type';
+import { useEnv } from '@directus/env';
+import type { SchemaInspector } from '@directus/schema';
+import { createInspector } from '@directus/schema';
+import { systemCollectionRows } from '@directus/system-data';
+import type { Filter, SchemaOverview } from '@directus/types';
+import { parseJSON, toArray } from '@directus/utils';
+import type { Knex } from 'knex';
+import { mapValues } from 'lodash-es';
+import { useBus } from '../bus/index.js';
+import { getLocalSchemaCache, setLocalSchemaCache } from '../cache.js';
+import { ALIAS_TYPES } from '../constants.js';
+import getDatabase from '../database/index.js';
+import { useLock } from '../lock/index.js';
+import { useLogger } from '../logger/index.js';
+import { RelationsService } from '../services/relations.js';
+import getDefaultValue from './get-default-value.js';
+import { getSystemFieldRowsWithAuthProviders } from './get-field-system-rows.js';
+import getLocalType from './get-local-type.js';
 
-export async function getSchema(options?: {
-	accountability?: Accountability;
-	database?: Knex;
-}): Promise<SchemaOverview> {
-	const database = options?.database || getDatabase();
-	const schemaInspector = SchemaInspector(database);
-	const { systemCache } = getCache();
+const logger = useLogger();
 
-	let result: SchemaOverview;
+export async function getSchema(
+	options?: {
+		database?: Knex;
 
-	if (env.CACHE_SCHEMA !== false) {
-		let cachedSchema;
+		/**
+		 * To bypass any cached schema if bypassCache is enabled.
+		 * Used to ensure schema snapshot/apply is not using outdated schema
+		 */
+		bypassCache?: boolean;
+	},
+	attempt = 0,
+): Promise<SchemaOverview> {
+	const MAX_ATTEMPTS = 3;
 
-		try {
-			cachedSchema = (await systemCache.get('schema')) as SchemaOverview;
-		} catch (err: any) {
-			logger.warn(err, `[schema-cache] Couldn't retrieve cache. ${err}`);
-		}
+	const env = useEnv();
 
-		if (cachedSchema) {
-			result = cachedSchema;
-		} else {
-			result = await getDatabaseSchema(database, schemaInspector);
+	if (options?.bypassCache || env['CACHE_SCHEMA'] === false) {
+		const database = options?.database || getDatabase();
+		const schemaInspector = createInspector(database);
 
-			try {
-				await setSystemCache('schema', result);
-			} catch (err: any) {
-				logger.warn(err, `[schema-cache] Couldn't save cache. ${err}`);
-			}
-		}
-	} else {
-		result = await getDatabaseSchema(database, schemaInspector);
+		return await getDatabaseSchema(database, schemaInspector);
 	}
 
-	return result;
+	const cached = await getLocalSchemaCache();
+
+	if (cached) {
+		return cached;
+	}
+
+	if (attempt >= MAX_ATTEMPTS) {
+		throw new Error(`Failed to get Schema information: hit infinite loop`);
+	}
+
+	const lock = useLock();
+	const bus = useBus();
+
+	const lockKey = 'schemaCache--preparing';
+	const messageKey = 'schemaCache--done';
+	const processId = await lock.increment(lockKey);
+
+	if (processId >= (env['CACHE_SCHEMA_MAX_ITERATIONS'] as number)) {
+		await lock.delete(lockKey);
+	}
+
+	const currentProcessShouldHandleOperation = processId === 1;
+
+	if (currentProcessShouldHandleOperation === false) {
+		logger.trace('Schema cache is prepared in another process, waiting for result.');
+
+		const timeout: Promise<any> = new Promise((_, reject) =>
+			setTimeout(reject, env['CACHE_SCHEMA_SYNC_TIMEOUT'] as number),
+		);
+
+		const subscription = new Promise<SchemaOverview>((resolve, reject) => {
+			bus.subscribe(messageKey, busListener).catch(reject);
+
+			function busListener(options: { schema: SchemaOverview | null }) {
+				if (options.schema === null) {
+					return reject();
+				}
+
+				cleanup();
+				setLocalSchemaCache(options.schema).catch(reject);
+				resolve(options.schema);
+			}
+
+			function cleanup() {
+				bus.unsubscribe(messageKey, busListener).catch(reject);
+			}
+		});
+
+		return Promise.race([timeout, subscription]).catch(() => getSchema(options, attempt + 1));
+	}
+
+	let schema: SchemaOverview | null = null;
+
+	try {
+		const database = options?.database || getDatabase();
+		const schemaInspector = createInspector(database);
+
+		schema = await getDatabaseSchema(database, schemaInspector);
+		await setLocalSchemaCache(schema);
+		return schema;
+	} finally {
+		await bus.publish(messageKey, { schema });
+		await lock.delete(lockKey);
+	}
 }
 
-async function getDatabaseSchema(
-	database: Knex,
-	schemaInspector: ReturnType<typeof SchemaInspector>
-): Promise<SchemaOverview> {
+async function getDatabaseSchema(database: Knex, schemaInspector: SchemaInspector): Promise<SchemaOverview> {
+	const env = useEnv();
+
 	const result: SchemaOverview = {
 		collections: {},
 		relations: [],
 	};
+
+	const systemFieldRows = getSystemFieldRowsWithAuthProviders();
 
 	const schemaOverview = await schemaInspector.overview();
 
@@ -70,7 +128,7 @@ async function getDatabaseSchema(
 	];
 
 	for (const [collection, info] of Object.entries(schemaOverview)) {
-		if (toArray(env.DB_EXCLUDE_TABLES).includes(collection)) {
+		if (toArray(env['DB_EXCLUDE_TABLES']).includes(collection)) {
 			logger.trace(`Collection "${collection}" is configured to be excluded and will be ignored`);
 			continue;
 		}
@@ -95,7 +153,7 @@ async function getDatabaseSchema(
 			note: collectionMeta?.note || null,
 			sortField: collectionMeta?.sort_field || null,
 			accountability: collectionMeta ? collectionMeta.accountability : 'all',
-			fields: mapValues(schemaOverview[collection].columns, (column) => {
+			fields: mapValues(schemaOverview[collection]?.columns, (column) => {
 				return {
 					field: column.column_name,
 					defaultValue: getDefaultValue(column) ?? null,
@@ -133,8 +191,8 @@ async function getDatabaseSchema(
 	for (const field of fields) {
 		if (!result.collections[field.collection]) continue;
 
-		const existing = result.collections[field.collection].fields[field.field];
-		const column = schemaOverview[field.collection].columns[field.field];
+		const existing = result.collections[field.collection]?.fields[field.field];
+		const column = schemaOverview[field.collection]?.columns[field.field];
 		const special = field.special ? toArray(field.special) : [];
 
 		if (ALIAS_TYPES.some((type) => special.includes(type)) === false && !existing) continue;
@@ -144,7 +202,7 @@ async function getDatabaseSchema(
 
 		if (validation && typeof validation === 'string') validation = parseJSON(validation);
 
-		result.collections[field.collection].fields[field.field] = {
+		result.collections[field.collection]!.fields[field.field] = {
 			field: field.field,
 			defaultValue: existing?.defaultValue ?? null,
 			nullable: existing?.nullable ?? true,
